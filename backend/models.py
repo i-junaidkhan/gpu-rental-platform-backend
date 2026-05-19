@@ -31,6 +31,7 @@ class Project(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     users = relationship("User", back_populates="project")
+    instances = relationship("Instance", back_populates="project")
 
 class User(Base):
     __tablename__ = "users"
@@ -63,6 +64,8 @@ class Instance(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=True) 
+    # (Nullable=True locally so DB migration doesn't crash, but enforced in API)
     plan_id = Column(Integer, ForeignKey("rental_plans.id"), nullable=False)
     pod_name = Column(String, unique=True, nullable=False)
     namespace = Column(String, nullable=False, default="gpu-rental-system")
@@ -72,6 +75,7 @@ class Instance(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     owner = relationship("User", back_populates="instances")
+    project = relationship("Project", back_populates="instances")
     plan = relationship("RentalPlan")
 
 class BillingEvent(Base):

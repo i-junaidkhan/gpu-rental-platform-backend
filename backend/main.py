@@ -240,16 +240,47 @@ def calculate_resource_usage(v1: client.CoreV1Api, node_name: str, resource_name
 def create_instance(instance: InstanceCreate, db: Session = Depends(get_db)):
     user = db.query(models.User).filter(models.User.id == instance.user_id).first()
     plan = db.query(models.RentalPlan).filter(models.RentalPlan.id == instance.plan_id).first()
+    project = db.query(models.Project).filter(models.Project.id == instance.project_id).first()
 
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     if not plan:
         raise HTTPException(status_code=404, detail="Plan not found")
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
 
+    # PHASE 2A: GPU Quota Enforcement
+    requested_count = int(plan.resource_count)
+    
+    current_instances = db.query(models.Instance).filter(
+        models.Instance.project_id == project.id,
+        models.Instance.status.in_([models.InstanceStatusEnum.RUNNING, models.InstanceStatusEnum.PENDING])
+    ).all()
+
+    current_gpu_usage = 0
+    for inst in current_instances:
+        inst_plan = db.query(models.RentalPlan).filter(models.RentalPlan.id == inst.plan_id).first()
+        if inst_plan:
+            current_gpu_usage += inst_plan.resource_count
+
+    # Quota Logic: 0 means unlimited ONLY for default-project (id 1)
+    if project.id == 1 and project.max_gpu_count == 0:
+        pass  # Unlimited bypass for default project
+    elif (current_gpu_usage + requested_count) > project.max_gpu_count:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": f"Project '{project.name}' GPU quota exceeded.",
+                "max_allowed": project.max_gpu_count,
+                "currently_using": current_gpu_usage,
+                "requested": requested_count
+            }
+        )
+
+    # --- YOUR EXISTING K8s LOGIC REMAINS UNTOUCHED ---
     namespace = "gpu-rental-system"
     node_name = "g01"
     resource_name = plan.k8s_resource_name
-    requested_count = int(plan.resource_count)
     safe_image = normalize_image_name(instance.image)
 
     try:
@@ -259,18 +290,11 @@ def create_instance(instance: InstanceCreate, db: Session = Depends(get_db)):
         if usage["free"] < requested_count:
             raise HTTPException(
                 status_code=409,
-                detail={
-                    "message": f"No available capacity for {resource_name}",
-                    "resource": resource_name,
-                    "capacity": usage["capacity"],
-                    "used": usage["used"],
-                    "free": usage["free"],
-                    "requested": requested_count,
-                },
+                detail=f"No available Kubernetes capacity for {resource_name}"
             )
 
         short_uuid = uuid.uuid4().hex[:6]
-        pod_name = f"gpu-tenant-u{user.id}-{short_uuid}"
+        pod_name = f"gpu-p{project.id}-u{user.id}-{short_uuid}"
 
         pod_manifest = client.V1Pod(
             metadata=client.V1ObjectMeta(
@@ -278,6 +302,7 @@ def create_instance(instance: InstanceCreate, db: Session = Depends(get_db)):
                 labels={
                     "app": "gpu-tenant-instance",
                     "user_id": str(user.id),
+                    "project_id": str(project.id), # Added project tracking to K8s
                     "plan_id": str(plan.id),
                     "billing": "true",
                 },
@@ -299,7 +324,7 @@ def create_instance(instance: InstanceCreate, db: Session = Depends(get_db)):
         )
 
         v1.create_namespaced_pod(namespace=namespace, body=pod_manifest)
-        logger.info(f"Created pod {pod_name} using {resource_name}:{requested_count}")
+        logger.info(f"Created pod {pod_name} using {resource_name}:{requested_count} for project {project.id}")
 
     except HTTPException:
         raise
@@ -310,8 +335,10 @@ def create_instance(instance: InstanceCreate, db: Session = Depends(get_db)):
         logger.error(f"Unexpected instance creation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+    # --- SAVE TO DB (NOW WITH PROJECT ID) ---
     db_instance = models.Instance(
         user_id=user.id,
+        project_id=project.id,  # Added project binding
         plan_id=plan.id,
         pod_name=pod_name,
         namespace=namespace,

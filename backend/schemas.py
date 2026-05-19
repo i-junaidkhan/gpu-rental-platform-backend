@@ -72,17 +72,22 @@ class PlanResponse(BaseModel):
         from_attributes = True
 
 class InstanceCreate(BaseModel):
+    project_id: int  # ADD THIS: Required from frontend
     user_id: int
     plan_id: int
-    gpu_id: Optional[int] = None  # Frontend sends this, we will ignore it for now
+    gpu_id: Optional[int] = None  
     image: str
 
 class InstanceResponse(BaseModel):
     id: int
+    project_id: Optional[int] = None  # ADD THIS
     user_id: int
     plan_id: int
     pod_name: str
     status: str
+    namespace: Optional[str] = None
+    pvc_name: Optional[str] = None
+    accumulated_cost: Optional[float] = 0.0
 
     class Config:
         from_attributes = True

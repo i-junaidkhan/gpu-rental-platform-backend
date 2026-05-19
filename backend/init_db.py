@@ -41,6 +41,14 @@ def run_safe_projects_migration(connection):
         SET project_id = (SELECT id FROM projects WHERE name = 'default-project' LIMIT 1)
         WHERE project_id IS NULL
     """))
+    
+    # Phase 2A: Safely bind existing instances to default-project
+    connection.execute(text("ALTER TABLE instances ADD COLUMN IF NOT EXISTS project_id INTEGER"))
+    connection.execute(text("""
+        UPDATE instances 
+        SET project_id = (SELECT id FROM projects WHERE name = 'default-project' LIMIT 1) 
+        WHERE project_id IS NULL
+    """))
 
     logger.info("Safe projects migration complete.")
 
