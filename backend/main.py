@@ -13,6 +13,9 @@ import models
 from schemas import (
     UserCreate,
     UserResponse,
+    ProjectCreate,
+    ProjectUpdate,
+    ProjectResponse,
     PlanCreate,
     PlanResponse,
     InstanceCreate,
@@ -74,13 +77,90 @@ def list_tables(db: Session = Depends(get_db)):
     return {"tables": [row[0] for row in result.fetchall()]}
 
 
+
+# =========================
+# Projects
+# =========================
+
+@app.get("/api/projects", response_model=list[ProjectResponse])
+def get_projects(db: Session = Depends(get_db)):
+    return db.query(models.Project).order_by(models.Project.id).all()
+
+
+@app.post("/api/projects", response_model=ProjectResponse)
+def create_project(project: ProjectCreate, db: Session = Depends(get_db)):
+    db_project = models.Project(**project.model_dump())
+    try:
+        db.add(db_project)
+        db.commit()
+        db.refresh(db_project)
+        return db_project
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Project creation failed: {e}")
+        raise HTTPException(status_code=400, detail="Project creation failed")
+
+
+@app.get("/api/projects/{project_id}", response_model=ProjectResponse)
+def get_project(project_id: int, db: Session = Depends(get_db)):
+    project = db.query(models.Project).filter(models.Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project
+
+
+@app.put("/api/projects/{project_id}", response_model=ProjectResponse)
+def update_project(project_id: int, payload: ProjectUpdate, db: Session = Depends(get_db)):
+    project = db.query(models.Project).filter(models.Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    updates = payload.model_dump(exclude_unset=True)
+    for key, value in updates.items():
+        setattr(project, key, value)
+
+    try:
+        db.commit()
+        db.refresh(project)
+        return project
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Project update failed: {e}")
+        raise HTTPException(status_code=400, detail="Project update failed")
+
+
+@app.delete("/api/projects/{project_id}")
+def delete_project(project_id: int, db: Session = Depends(get_db)):
+    project = db.query(models.Project).filter(models.Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if db.query(models.User).filter(models.User.project_id == project_id).first():
+        raise HTTPException(status_code=400, detail="Cannot delete project while users are assigned")
+
+    try:
+        db.delete(project)
+        db.commit()
+        return {"message": "Project deleted", "id": project_id}
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Project deletion failed: {e}")
+        raise HTTPException(status_code=400, detail="Project deletion failed")
+
+
 # =========================
 # Users
 # =========================
 
 @app.post("/api/users", response_model=UserResponse)
 def create_user(user: UserCreate, db: Session = Depends(get_db)):
-    db_user = models.User(**user.model_dump())
+    data = user.model_dump()
+    project_id = data.get("project_id")
+    if project_id is not None:
+        project = db.query(models.Project).filter(models.Project.id == project_id).first()
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+    db_user = models.User(**data)
 
     try:
         db.add(db_user)

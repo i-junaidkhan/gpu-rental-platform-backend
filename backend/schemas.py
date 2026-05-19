@@ -3,11 +3,39 @@ from typing import Optional
 from datetime import datetime
 
 
+class ProjectCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    max_gpu_count: Optional[int] = 0
+    max_storage_gb: Optional[int] = 0
+
+
+class ProjectUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    max_gpu_count: Optional[int] = None
+    max_storage_gb: Optional[int] = None
+
+
+class ProjectResponse(BaseModel):
+    id: int
+    name: str
+    description: Optional[str] = None
+    max_gpu_count: int
+    max_storage_gb: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 class UserCreate(BaseModel):
     username: str
     email: str
     role: Optional[str] = "user"
     balance: Optional[float] = 0.0
+    project_id: Optional[int] = None
+    mfa_enabled: Optional[bool] = False
 
 
 class UserResponse(BaseModel):
@@ -16,6 +44,8 @@ class UserResponse(BaseModel):
     email: str
     role: str
     balance: float
+    project_id: Optional[int] = None
+    mfa_enabled: bool = False
     created_at: datetime
 
     class Config:

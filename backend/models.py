@@ -1,5 +1,5 @@
 import logging
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Enum
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Enum, Boolean
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from sqlalchemy.exc import SQLAlchemyError
@@ -19,6 +19,19 @@ class InstanceStatusEnum(str, enum.Enum):
     ERROR = "error"
     DELETED = "deleted"
 
+
+class Project(Base):
+    __tablename__ = "projects"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, index=True, nullable=False)
+    description = Column(String, nullable=True)
+    max_gpu_count = Column(Integer, default=0)
+    max_storage_gb = Column(Integer, default=0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    users = relationship("User", back_populates="project")
+
 class User(Base):
     __tablename__ = "users"
 
@@ -26,9 +39,12 @@ class User(Base):
     username = Column(String, unique=True, index=True, nullable=False)
     email = Column(String, unique=True, index=True, nullable=False)
     role = Column(String, default="user")
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
+    mfa_enabled = Column(Boolean, default=False, nullable=False)
     balance = Column(Float, default=0.0)  # Required to auto-kill instances when funds run out
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+    project = relationship("Project", back_populates="users")
     instances = relationship("Instance", back_populates="owner", cascade="all, delete-orphan")
     billing_events = relationship("BillingEvent", back_populates="user", cascade="all, delete-orphan")
 
