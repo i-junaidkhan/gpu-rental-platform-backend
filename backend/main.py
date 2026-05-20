@@ -12,15 +12,18 @@ from database import get_db
 import models
 from schemas import (
     UserCreate,
+    UserUpdate,
     UserResponse,
     ProjectCreate,
     ProjectUpdate,
     ProjectResponse,
     PlanCreate,
+    PlanUpdate,
     PlanResponse,
     InstanceCreate,
     InstanceResponse,
     StorageVolumeCreate,
+    StorageVolumeUpdate,
     StorageVolumeResponse,
     UserStorageCreate,
     UserStorageResponse,
@@ -148,6 +151,38 @@ def delete_project(project_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Project deletion failed")
 
 
+@app.get("/api/projects/{project_id}/summary")
+def get_project_summary(project_id: int, db: Session = Depends(get_db)):
+    project = validate_project_exists(db, project_id)
+
+    users_count = db.query(models.User).filter(models.User.project_id == project_id).count()
+    active_instances = db.query(models.Instance).filter(
+        models.Instance.project_id == project_id,
+        models.Instance.status.in_([models.InstanceStatusEnum.RUNNING, models.InstanceStatusEnum.PENDING])
+    ).all()
+
+    gpu_usage = 0
+    for inst in active_instances:
+        plan = db.query(models.RentalPlan).filter(models.RentalPlan.id == inst.plan_id).first()
+        if plan:
+            gpu_usage += int(plan.resource_count or 0)
+
+    storage_allocated_gb = get_project_storage_usage_gb(db, project_id)
+
+    return {
+        "project_id": project.id,
+        "project_name": project.name,
+        "max_gpu_count": project.max_gpu_count,
+        "gpu_used": gpu_usage,
+        "gpu_available": None if (project.id == 1 and project.max_gpu_count == 0) else max(project.max_gpu_count - gpu_usage, 0),
+        "max_storage_gb": project.max_storage_gb,
+        "storage_allocated_gb": storage_allocated_gb,
+        "storage_available_gb": None if project.max_storage_gb == 0 else max(project.max_storage_gb - storage_allocated_gb, 0),
+        "users_count": users_count,
+        "active_instances_count": len(active_instances),
+    }
+
+
 # =========================
 # Users
 # =========================
@@ -157,9 +192,7 @@ def create_user(user: UserCreate, db: Session = Depends(get_db)):
     data = user.model_dump()
     project_id = data.get("project_id")
     if project_id is not None:
-        project = db.query(models.Project).filter(models.Project.id == project_id).first()
-        if not project:
-            raise HTTPException(status_code=404, detail="Project not found")
+        validate_project_exists(db, project_id)
     db_user = models.User(**data)
 
     try:
@@ -174,9 +207,62 @@ def create_user(user: UserCreate, db: Session = Depends(get_db)):
 
 
 @app.get("/api/users", response_model=list[UserResponse])
-def get_users(db: Session = Depends(get_db)):
-    return db.query(models.User).order_by(models.User.id).all()
+def get_users(project_id: int | None = None, db: Session = Depends(get_db)):
+    query = db.query(models.User)
+    if project_id is not None:
+        query = query.filter(models.User.project_id == project_id)
+    return query.order_by(models.User.id).all()
 
+
+@app.get("/api/users/{user_id}", response_model=UserResponse)
+def get_user(user_id: int, db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+
+@app.put("/api/users/{user_id}", response_model=UserResponse)
+def update_user(user_id: int, payload: UserUpdate, db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    updates = payload.model_dump(exclude_unset=True)
+    if "project_id" in updates and updates["project_id"] is not None:
+        validate_project_exists(db, updates["project_id"])
+
+    for key, value in updates.items():
+        setattr(user, key, value)
+
+    try:
+        db.commit()
+        db.refresh(user)
+        return user
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"User update failed: {e}")
+        raise HTTPException(status_code=400, detail="User update failed")
+
+
+@app.delete("/api/users/{user_id}")
+def delete_user(user_id: int, db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if db.query(models.Instance).filter(
+        models.Instance.user_id == user_id,
+        models.Instance.status.in_([models.InstanceStatusEnum.RUNNING, models.InstanceStatusEnum.PENDING])
+    ).first():
+        raise HTTPException(status_code=400, detail="Cannot delete user with running/pending instances")
+    try:
+        db.delete(user)
+        db.commit()
+        return {"message": "User deleted", "id": user_id}
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"User deletion failed: {e}")
+        raise HTTPException(status_code=400, detail="User deletion failed")
 
 # =========================
 # Rental Plans
@@ -202,6 +288,41 @@ def get_plans(db: Session = Depends(get_db)):
     return db.query(models.RentalPlan).order_by(models.RentalPlan.id).all()
 
 
+@app.put("/api/rental-plans/{plan_id}", response_model=PlanResponse)
+def update_plan(plan_id: int, payload: PlanUpdate, db: Session = Depends(get_db)):
+    plan = db.query(models.RentalPlan).filter(models.RentalPlan.id == plan_id).first()
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    updates = payload.model_dump(exclude_unset=True)
+    for key, value in updates.items():
+        setattr(plan, key, value)
+    try:
+        db.commit()
+        db.refresh(plan)
+        return plan
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Plan update failed: {e}")
+        raise HTTPException(status_code=400, detail="Plan update failed")
+
+
+@app.delete("/api/rental-plans/{plan_id}")
+def delete_plan(plan_id: int, db: Session = Depends(get_db)):
+    plan = db.query(models.RentalPlan).filter(models.RentalPlan.id == plan_id).first()
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    if db.query(models.Instance).filter(models.Instance.plan_id == plan_id).first():
+        raise HTTPException(status_code=400, detail="Cannot delete plan with existing instances")
+    try:
+        db.delete(plan)
+        db.commit()
+        return {"message": "Plan deleted", "id": plan_id}
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Plan deletion failed: {e}")
+        raise HTTPException(status_code=400, detail="Plan deletion failed")
+
+
 # =========================
 # Instances
 # =========================
@@ -217,6 +338,47 @@ def normalize_image_name(image: str) -> str:
     if "/" not in image:
         return f"docker.io/library/{image}"
     return f"docker.io/{image}"
+
+
+
+ALLOWED_INSTANCE_IMAGES = {
+    "ubuntu:22.04",
+    "docker.io/library/ubuntu:22.04",
+    "nvidia/cuda:12.0-base-ubuntu22.04",
+    "docker.io/nvidia/cuda:12.0-base-ubuntu22.04",
+    "nvidia/cuda:11.8-base-ubuntu22.04",
+    "docker.io/nvidia/cuda:11.8-base-ubuntu22.04",
+    "pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime",
+    "docker.io/pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime",
+    "tensorflow/tensorflow:2.13.0-gpu",
+    "docker.io/tensorflow/tensorflow:2.13.0-gpu",
+    "jupyter/tensorflow-notebook:latest",
+    "docker.io/jupyter/tensorflow-notebook:latest",
+}
+
+def normalize_and_validate_image(image: str) -> str:
+    safe_image = normalize_image_name(image)
+    if image not in ALLOWED_INSTANCE_IMAGES and safe_image not in ALLOWED_INSTANCE_IMAGES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Image is not allowed: {image}. Add it to the backend allowlist first."
+        )
+    return safe_image
+
+def get_project_storage_usage_gb(db: Session, project_id: int) -> int:
+    rows = db.query(models.UserStorage).filter(models.UserStorage.project_id == project_id).all()
+    return int(sum(int(row.quota_gb or 0) for row in rows))
+
+def validate_project_exists(db: Session, project_id: int):
+    project = db.query(models.Project).filter(models.Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project
+
+def get_instance_command(app_type: str | None):
+    # Keep runtime safe: all modes start a long-running container for now.
+    # Real Jupyter/VSCode launch needs image-specific commands and service exposure.
+    return ["sleep", "infinity"]
 
 
 def calculate_resource_usage(v1: client.CoreV1Api, node_name: str, resource_name: str) -> dict:
@@ -281,7 +443,7 @@ def create_instance(instance: InstanceCreate, db: Session = Depends(get_db)):
     namespace = "gpu-rental-system"
     node_name = "g01"
     resource_name = plan.k8s_resource_name
-    safe_image = normalize_image_name(instance.image)
+    safe_image = normalize_and_validate_image(instance.image)
 
     try:
         v1 = client.CoreV1Api()
@@ -296,27 +458,88 @@ def create_instance(instance: InstanceCreate, db: Session = Depends(get_db)):
         short_uuid = uuid.uuid4().hex[:6]
         pod_name = f"gpu-p{project.id}-u{user.id}-{short_uuid}"
 
+        limits = {resource_name: str(requested_count)}
+        requests = {}
+
+        if instance.cpu_cores is not None:
+            cpu_value = str(instance.cpu_cores)
+            limits["cpu"] = cpu_value
+            requests["cpu"] = cpu_value
+
+        if instance.memory_gb is not None:
+            mem_value = f"{instance.memory_gb}Gi"
+            limits["memory"] = mem_value
+            requests["memory"] = mem_value
+
+        volumes = []
+        volume_mounts = []
+        pvc_name = "mock-pvc-for-now"
+
+        if instance.storage_id is not None:
+            storage = db.query(models.UserStorage).filter(models.UserStorage.id == instance.storage_id).first()
+            if not storage:
+                raise HTTPException(status_code=404, detail="Storage allocation not found")
+            if storage.user_id != user.id or storage.project_id != project.id:
+                raise HTTPException(status_code=403, detail="Storage allocation does not belong to this user/project")
+            pvc_name = f"user-storage-{storage.id}"
+            volumes.append(
+                client.V1Volume(
+                    name="workspace-storage",
+                    host_path=client.V1HostPathVolumeSource(
+                        path=storage.folder_path,
+                        type="DirectoryOrCreate"
+                    )
+                )
+            )
+            volume_mounts.append(
+                client.V1VolumeMount(
+                    name="workspace-storage",
+                    mount_path="/workspace"
+                )
+            )
+
+        if instance.shm_gb is not None and instance.shm_gb > 0:
+            volumes.append(
+                client.V1Volume(
+                    name="dshm",
+                    empty_dir=client.V1EmptyDirVolumeSource(
+                        medium="Memory",
+                        size_limit=f"{instance.shm_gb}Gi"
+                    )
+                )
+            )
+            volume_mounts.append(
+                client.V1VolumeMount(
+                    name="dshm",
+                    mount_path="/dev/shm"
+                )
+            )
+
         pod_manifest = client.V1Pod(
             metadata=client.V1ObjectMeta(
                 name=pod_name,
                 labels={
                     "app": "gpu-tenant-instance",
                     "user_id": str(user.id),
-                    "project_id": str(project.id), # Added project tracking to K8s
+                    "project_id": str(project.id),
                     "plan_id": str(plan.id),
                     "billing": "true",
+                    "app_type": str(instance.app_type or "terminal"),
                 },
             ),
             spec=client.V1PodSpec(
                 node_name=node_name,
                 restart_policy="Never",
+                volumes=volumes or None,
                 containers=[
                     client.V1Container(
                         name="ai-workspace",
                         image=safe_image,
-                        command=["sleep", "infinity"],
+                        command=get_instance_command(instance.app_type),
+                        volume_mounts=volume_mounts or None,
                         resources=client.V1ResourceRequirements(
-                            limits={resource_name: str(requested_count)}
+                            limits=limits,
+                            requests=requests or None,
                         ),
                     )
                 ],
@@ -342,7 +565,7 @@ def create_instance(instance: InstanceCreate, db: Session = Depends(get_db)):
         plan_id=plan.id,
         pod_name=pod_name,
         namespace=namespace,
-        pvc_name="mock-pvc-for-now",
+        pvc_name=pvc_name,
         status=models.InstanceStatusEnum.RUNNING,
     )
 
@@ -808,6 +1031,24 @@ def get_storage_volume(volume_id: int, db: Session = Depends(get_db)):
     return volume
 
 
+@app.put("/api/storage-volumes/{volume_id}", response_model=StorageVolumeResponse)
+def update_storage_volume(volume_id: int, payload: StorageVolumeUpdate, db: Session = Depends(get_db)):
+    volume = db.query(models.StorageVolume).filter(models.StorageVolume.id == volume_id).first()
+    if not volume:
+        raise HTTPException(status_code=404, detail="Storage volume not found")
+    updates = payload.model_dump(exclude_unset=True)
+    for key, value in updates.items():
+        setattr(volume, key, value)
+    try:
+        db.commit()
+        db.refresh(volume)
+        return volume
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Storage volume update failed: {e}")
+        raise HTTPException(status_code=400, detail="Storage volume update failed")
+
+
 @app.delete("/api/storage-volumes/{volume_id}")
 def delete_storage_volume(volume_id: int, db: Session = Depends(get_db)):
     volume = db.query(models.StorageVolume).filter(models.StorageVolume.id == volume_id).first()
@@ -829,8 +1070,13 @@ def delete_storage_volume(volume_id: int, db: Session = Depends(get_db)):
 # =========================
 
 @app.get("/api/user-storages", response_model=list[UserStorageResponse])
-def get_user_storages(db: Session = Depends(get_db)):
-    return db.query(models.UserStorage).order_by(models.UserStorage.id).all()
+def get_user_storages(project_id: int | None = None, user_id: int | None = None, db: Session = Depends(get_db)):
+    query = db.query(models.UserStorage)
+    if project_id is not None:
+        query = query.filter(models.UserStorage.project_id == project_id)
+    if user_id is not None:
+        query = query.filter(models.UserStorage.user_id == user_id)
+    return query.order_by(models.UserStorage.id).all()
 
 
 @app.get("/api/user-storages/user/{user_id}", response_model=list[UserStorageResponse])
@@ -840,41 +1086,61 @@ def get_user_storage_by_user(user_id: int, db: Session = Depends(get_db)):
 
 @app.post("/api/user-storages", response_model=UserStorageResponse)
 def create_user_storage(storage: UserStorageCreate, db: Session = Depends(get_db)):
-    # Verify user exists
     user = db.query(models.User).filter(models.User.id == storage.user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    
-    # Verify volume exists
+
+    project_id = storage.project_id or user.project_id
+    if project_id is None:
+        raise HTTPException(status_code=400, detail="User has no project_id; assign user to project first")
+    project = validate_project_exists(db, project_id)
+
+    if user.project_id != project.id:
+        raise HTTPException(status_code=403, detail="User does not belong to selected project")
+
     volume = db.query(models.StorageVolume).filter(models.StorageVolume.id == storage.volume_id).first()
     if not volume:
         raise HTTPException(status_code=404, detail="Storage volume not found")
-    
-    # Check if user already has storage on this volume
+
+    if storage.quota_gb <= 0:
+        raise HTTPException(status_code=400, detail="quota_gb must be positive")
+
+    if volume.used_capacity_gb + storage.quota_gb > volume.total_capacity_gb:
+        raise HTTPException(status_code=409, detail="Storage volume capacity exceeded")
+
+    current_project_storage = get_project_storage_usage_gb(db, project.id)
+    if project.max_storage_gb > 0 and current_project_storage + storage.quota_gb > project.max_storage_gb:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": f"Project '{project.name}' storage quota exceeded.",
+                "max_allowed_gb": project.max_storage_gb,
+                "currently_allocated_gb": current_project_storage,
+                "requested_gb": storage.quota_gb
+            }
+        )
+
     existing = db.query(models.UserStorage).filter(
         models.UserStorage.user_id == storage.user_id,
         models.UserStorage.volume_id == storage.volume_id
     ).first()
     if existing:
         raise HTTPException(status_code=400, detail="User already has storage on this volume")
-    
-    db_storage = models.UserStorage(**storage.model_dump())
-    
+
+    data = storage.model_dump()
+    data["project_id"] = project.id
+    db_storage = models.UserStorage(**data)
+
     try:
         db.add(db_storage)
-        db.commit()
-        db.refresh(db_storage)
-        
-        # Update volume used capacity
         volume.used_capacity_gb += storage.quota_gb
         db.commit()
-        
+        db.refresh(db_storage)
         return db_storage
     except SQLAlchemyError as e:
         db.rollback()
         logger.error(f"User storage creation failed: {e}")
         raise HTTPException(status_code=400, detail="User storage creation failed")
-
 
 @app.delete("/api/user-storages/{storage_id}")
 def delete_user_storage(storage_id: int, db: Session = Depends(get_db)):
@@ -902,26 +1168,40 @@ def update_user_storage_quota(storage_id: int, payload: dict, db: Session = Depe
     storage = db.query(models.UserStorage).filter(models.UserStorage.id == storage_id).first()
     if not storage:
         raise HTTPException(status_code=404, detail="User storage not found")
-    
+
     new_quota = payload.get("quota_gb")
     if new_quota is None:
         raise HTTPException(status_code=400, detail="quota_gb is required")
-    
+    new_quota = int(new_quota)
+    if new_quota <= 0:
+        raise HTTPException(status_code=400, detail="quota_gb must be positive")
+
     try:
-        # Update volume used capacity
         volume = db.query(models.StorageVolume).filter(models.StorageVolume.id == storage.volume_id).first()
+        delta = new_quota - storage.quota_gb
+        if volume and volume.used_capacity_gb + delta > volume.total_capacity_gb:
+            raise HTTPException(status_code=409, detail="Storage volume capacity exceeded")
+
+        if storage.project_id:
+            project = validate_project_exists(db, storage.project_id)
+            current_project_storage = get_project_storage_usage_gb(db, storage.project_id)
+            if project.max_storage_gb > 0 and current_project_storage + delta > project.max_storage_gb:
+                raise HTTPException(status_code=409, detail="Project storage quota exceeded")
+
         if volume:
-            volume.used_capacity_gb = volume.used_capacity_gb - storage.quota_gb + new_quota
-        
+            volume.used_capacity_gb = volume.used_capacity_gb + delta
+
         storage.quota_gb = new_quota
         db.commit()
         db.refresh(storage)
-        
+
         return {
             "message": "Quota updated",
             "id": storage_id,
             "new_quota_gb": new_quota
         }
+    except HTTPException:
+        raise
     except SQLAlchemyError as e:
         db.rollback()
         logger.error(f"Quota update failed: {e}")

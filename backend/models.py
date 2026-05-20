@@ -32,6 +32,7 @@ class Project(Base):
 
     users = relationship("User", back_populates="project")
     instances = relationship("Instance", back_populates="project")
+    user_storages = relationship("UserStorage", back_populates="project")
 
 class User(Base):
     __tablename__ = "users"
@@ -112,6 +113,7 @@ class UserStorage(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
     volume_id = Column(Integer, ForeignKey("storage_volumes.id"), nullable=False)
     folder_path = Column(String, nullable=False)  # e.g., "/data3/users/user1"
     quota_gb = Column(Integer, nullable=False)  # Max storage for this user
@@ -119,4 +121,5 @@ class UserStorage(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User")
+    project = relationship("Project", back_populates="user_storages")
     volume = relationship("StorageVolume", back_populates="user_storages")

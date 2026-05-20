@@ -50,6 +50,17 @@ def run_safe_projects_migration(connection):
         WHERE project_id IS NULL
     """))
 
+    # Batch 3: safely bind existing storage allocations to projects.
+    connection.execute(text("ALTER TABLE user_storages ADD COLUMN IF NOT EXISTS project_id INTEGER"))
+    connection.execute(text("""
+        UPDATE user_storages us
+        SET project_id = COALESCE(
+            (SELECT u.project_id FROM users u WHERE u.id = us.user_id),
+            (SELECT id FROM projects WHERE name = 'default-project' LIMIT 1)
+        )
+        WHERE us.project_id IS NULL
+    """))
+
     logger.info("Safe projects migration complete.")
 
 

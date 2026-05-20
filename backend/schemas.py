@@ -38,6 +38,15 @@ class UserCreate(BaseModel):
     mfa_enabled: Optional[bool] = False
 
 
+class UserUpdate(BaseModel):
+    username: Optional[str] = None
+    email: Optional[str] = None
+    role: Optional[str] = None
+    balance: Optional[float] = None
+    project_id: Optional[int] = None
+    mfa_enabled: Optional[bool] = None
+
+
 class UserResponse(BaseModel):
     id: int
     username: str
@@ -60,6 +69,14 @@ class PlanCreate(BaseModel):
     price_per_hour: float
 
 
+class PlanUpdate(BaseModel):
+    name: Optional[str] = None
+    plan_type: Optional[str] = None
+    k8s_resource_name: Optional[str] = None
+    resource_count: Optional[int] = None
+    price_per_hour: Optional[float] = None
+
+
 class PlanResponse(BaseModel):
     id: int
     name: str
@@ -72,11 +89,16 @@ class PlanResponse(BaseModel):
         from_attributes = True
 
 class InstanceCreate(BaseModel):
-    project_id: int  # ADD THIS: Required from frontend
+    project_id: int
     user_id: int
     plan_id: int
-    gpu_id: Optional[int] = None  
+    gpu_id: Optional[int] = None
     image: str
+    cpu_cores: Optional[float] = None
+    memory_gb: Optional[float] = None
+    shm_gb: Optional[float] = None
+    storage_id: Optional[int] = None
+    app_type: Optional[str] = "terminal"
 
 class InstanceResponse(BaseModel):
     id: int
@@ -102,6 +124,14 @@ class StorageVolumeCreate(BaseModel):
     status: Optional[str] = "available"
 
 
+class StorageVolumeUpdate(BaseModel):
+    name: Optional[str] = None
+    mount_path: Optional[str] = None
+    total_capacity_gb: Optional[int] = None
+    storage_class: Optional[str] = None
+    status: Optional[str] = None
+
+
 class StorageVolumeResponse(BaseModel):
     id: int
     name: str
@@ -121,11 +151,13 @@ class UserStorageCreate(BaseModel):
     volume_id: int
     folder_path: str
     quota_gb: int
+    project_id: Optional[int] = None
 
 
 class UserStorageResponse(BaseModel):
     id: int
     user_id: int
+    project_id: Optional[int] = None
     volume_id: int
     folder_path: str
     quota_gb: int
