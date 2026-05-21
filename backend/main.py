@@ -27,6 +27,8 @@ from schemas import (
     StorageVolumeResponse,
     UserStorageCreate,
     UserStorageResponse,
+    InstancePortCreate,
+    InstancePortResponse,
 )
 
 
@@ -381,6 +383,33 @@ def get_instance_command(app_type: str | None):
     return ["sleep", "infinity"]
 
 
+
+def app_default_port(app_type: str | None) -> int:
+    app = (app_type or "terminal").lower()
+    if app == "jupyter":
+        return 8888
+    if app == "vscode":
+        return 8080
+    if app == "ssh":
+        return 22
+    return 8888
+
+
+def build_launch_url(node_ip: str, node_port: int, app_type: str | None = None) -> str:
+    scheme = "ssh" if (app_type or "").lower() == "ssh" else "http"
+    return f"{scheme}://{node_ip}:{node_port}"
+
+
+def get_node_external_ip(v1: client.CoreV1Api, node_name: str = "g01") -> str:
+    try:
+        node = v1.read_node(name=node_name)
+        for addr in node.status.addresses or []:
+            if addr.type in ["ExternalIP", "InternalIP"]:
+                return addr.address
+    except Exception:
+        pass
+    return "192.168.10.226"
+
 def calculate_resource_usage(v1: client.CoreV1Api, node_name: str, resource_name: str) -> dict:
     node = v1.read_node(name=node_name)
     allocatable = node.status.allocatable or {}
@@ -695,6 +724,268 @@ def instance_action(instance_id: int, payload: dict, db: Session = Depends(get_d
         db.commit()
 
         return {"message": "Instance started", "id": instance.id, "pod_name": instance.pod_name, "status": instance.status.value}
+
+
+
+@app.get("/api/instances/{instance_id}/ports", response_model=list[InstancePortResponse])
+def list_instance_ports(instance_id: int, db: Session = Depends(get_db)):
+    instance = db.query(models.Instance).filter(models.Instance.id == instance_id).first()
+    if not instance:
+        raise HTTPException(status_code=404, detail="Instance not found")
+    return db.query(models.InstancePort).filter(models.InstancePort.instance_id == instance_id).all()
+
+
+@app.post("/api/instances/{instance_id}/ports", response_model=InstancePortResponse)
+def open_instance_port(instance_id: int, payload: InstancePortCreate, db: Session = Depends(get_db)):
+    instance = db.query(models.Instance).filter(models.Instance.id == instance_id).first()
+    if not instance:
+        raise HTTPException(status_code=404, detail="Instance not found")
+
+    target_port = int(payload.target_port or payload.port)
+    exposed_port = int(payload.port)
+    protocol = (payload.protocol or "TCP").upper()
+    service_name = f"{instance.pod_name}-port-{exposed_port}".lower().replace("_", "-")[:63]
+
+    try:
+        v1 = client.CoreV1Api()
+        service = client.V1Service(
+            metadata=client.V1ObjectMeta(
+                name=service_name,
+                namespace=instance.namespace,
+                labels={
+                    "app": "gpu-tenant-instance-port",
+                    "instance_id": str(instance.id),
+                    "pod_name": instance.pod_name,
+                },
+            ),
+            spec=client.V1ServiceSpec(
+                type="NodePort",
+                selector={"app": "gpu-tenant-instance", "pod_name": instance.pod_name},
+                ports=[
+                    client.V1ServicePort(
+                        name=f"port-{exposed_port}",
+                        port=exposed_port,
+                        target_port=target_port,
+                        protocol=protocol,
+                    )
+                ],
+            ),
+        )
+
+        try:
+            created = v1.create_namespaced_service(namespace=instance.namespace, body=service)
+        except client.exceptions.ApiException as e:
+            if e.status == 409:
+                created = v1.read_namespaced_service(name=service_name, namespace=instance.namespace)
+            else:
+                raise
+
+        node_port = None
+        if created.spec and created.spec.ports:
+            node_port = created.spec.ports[0].node_port
+
+        node_ip = get_node_external_ip(v1, "g01")
+        launch_url = build_launch_url(node_ip, node_port, None) if node_port else None
+
+    except client.exceptions.ApiException as e:
+        logger.error(f"Failed to open service port for instance {instance_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Kubernetes service creation failed: {e.reason}")
+    except Exception as e:
+        logger.error(f"Unexpected port open error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    existing = db.query(models.InstancePort).filter(
+        models.InstancePort.instance_id == instance_id,
+        models.InstancePort.port == exposed_port,
+        models.InstancePort.status == "open",
+    ).first()
+
+    if existing:
+        existing.target_port = target_port
+        existing.node_port = node_port
+        existing.protocol = protocol
+        existing.service_name = service_name
+        existing.launch_url = launch_url
+        db.commit()
+        db.refresh(existing)
+        return existing
+
+    row = models.InstancePort(
+        instance_id=instance_id,
+        port=exposed_port,
+        target_port=target_port,
+        node_port=node_port,
+        protocol=protocol,
+        service_name=service_name,
+        launch_url=launch_url,
+        status="open",
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+@app.delete("/api/instances/{instance_id}/ports/{port_id}")
+def close_instance_port(instance_id: int, port_id: int, db: Session = Depends(get_db)):
+    instance = db.query(models.Instance).filter(models.Instance.id == instance_id).first()
+    if not instance:
+        raise HTTPException(status_code=404, detail="Instance not found")
+
+    port_row = db.query(models.InstancePort).filter(
+        models.InstancePort.id == port_id,
+        models.InstancePort.instance_id == instance_id,
+    ).first()
+    if not port_row:
+        raise HTTPException(status_code=404, detail="Port record not found")
+
+    try:
+        v1 = client.CoreV1Api()
+        v1.delete_namespaced_service(name=port_row.service_name, namespace=instance.namespace)
+    except client.exceptions.ApiException as e:
+        if e.status != 404:
+            raise HTTPException(status_code=500, detail=f"Failed to delete service: {e.reason}")
+
+    port_row.status = "closed"
+    db.commit()
+    return {"message": "Port closed", "id": port_row.id, "port": port_row.port}
+
+
+@app.get("/api/instances/{instance_id}/launch")
+def get_instance_launch(instance_id: int, db: Session = Depends(get_db)):
+    instance = db.query(models.Instance).filter(models.Instance.id == instance_id).first()
+    if not instance:
+        raise HTTPException(status_code=404, detail="Instance not found")
+    open_ports = db.query(models.InstancePort).filter(
+        models.InstancePort.instance_id == instance_id,
+        models.InstancePort.status == "open",
+    ).all()
+    return {
+        "instance_id": instance.id,
+        "pod_name": instance.pod_name,
+        "status": instance.status.value if hasattr(instance.status, "value") else str(instance.status),
+        "ports": [
+            {
+                "id": p.id,
+                "port": p.port,
+                "target_port": p.target_port,
+                "node_port": p.node_port,
+                "launch_url": p.launch_url,
+                "status": p.status,
+            }
+            for p in open_ports
+        ],
+    }
+
+
+@app.get("/api/monitoring/pods")
+def monitoring_pods(db: Session = Depends(get_db)):
+    instances = db.query(models.Instance).all()
+    return [
+        {
+            "instance_id": i.id,
+            "pod_name": i.pod_name,
+            "namespace": i.namespace,
+            "project_id": i.project_id,
+            "user_id": i.user_id,
+            "plan_id": i.plan_id,
+            "status": i.status.value if hasattr(i.status, "value") else str(i.status),
+            "accumulated_cost": i.accumulated_cost or 0.0,
+        }
+        for i in instances
+    ]
+
+
+@app.get("/api/monitoring/nodes")
+def monitoring_nodes():
+    v1 = client.CoreV1Api()
+    nodes = v1.list_node().items
+    result = []
+    for node in nodes:
+        conditions = {c.type: c.status for c in (node.status.conditions or [])}
+        result.append({
+            "name": node.metadata.name,
+            "ready": conditions.get("Ready") == "True",
+            "cpu": (node.status.capacity or {}).get("cpu"),
+            "memory": (node.status.capacity or {}).get("memory"),
+            "gpu": (node.status.capacity or {}).get("nvidia.com/gpu", "0"),
+            "internal_ip": next((a.address for a in node.status.addresses or [] if a.type == "InternalIP"), None),
+        })
+    return result
+
+
+@app.get("/api/monitoring/gpus")
+def monitoring_gpus():
+    v1 = client.CoreV1Api()
+    nodes = v1.list_node().items
+    rows = []
+    for node in nodes:
+        capacity = node.status.capacity or {}
+        allocatable = node.status.allocatable or {}
+        labels = node.metadata.labels or {}
+        for key in sorted(set(list(capacity.keys()) + list(allocatable.keys()))):
+            if key.startswith("nvidia.com/"):
+                cap = int(capacity.get(key, "0"))
+                alloc = int(allocatable.get(key, "0"))
+                rows.append({
+                    "node_name": node.metadata.name,
+                    "resource_name": key,
+                    "capacity": cap,
+                    "allocatable": alloc,
+                    "product": labels.get("nvidia.com/gpu.product"),
+                    "mig_strategy": labels.get("nvidia.com/mig.strategy"),
+                    "status": "available" if alloc > 0 else "unavailable",
+                })
+    return rows
+
+
+@app.get("/api/billing/usage/raw")
+def billing_usage_raw(db: Session = Depends(get_db)):
+    instances = db.query(models.Instance).all()
+    rows = []
+    for i in instances:
+        plan = db.query(models.RentalPlan).filter(models.RentalPlan.id == i.plan_id).first()
+        rate = float(plan.price_per_hour) if plan else 0.0
+        rows.append({
+            "instance_id": i.id,
+            "pod_name": i.pod_name,
+            "user_id": i.user_id,
+            "project_id": i.project_id,
+            "plan_id": i.plan_id,
+            "status": i.status.value if hasattr(i.status, "value") else str(i.status),
+            "price_per_hour": rate,
+            "accumulated_cost": float(i.accumulated_cost or 0.0),
+        })
+    return rows
+
+
+@app.get("/api/billing/usage/summary")
+def billing_usage_summary(period: str = "daily", db: Session = Depends(get_db)):
+    rows = billing_usage_raw(db)
+    total_cost = sum(float(r.get("accumulated_cost") or 0.0) for r in rows)
+    active_count = sum(1 for r in rows if str(r.get("status")).lower() == "running")
+    return {
+        "period": period,
+        "total_instances": len(rows),
+        "active_instances": active_count,
+        "total_accumulated_cost": total_cost,
+        "by_project": [
+            {
+                "project_id": pid,
+                "instances": len(items),
+                "active_instances": sum(1 for r in items if str(r.get("status")).lower() == "running"),
+                "accumulated_cost": sum(float(r.get("accumulated_cost") or 0.0) for r in items),
+            }
+            for pid, items in _group_by_project(rows).items()
+        ],
+    }
+
+
+def _group_by_project(rows):
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(row.get("project_id"), []).append(row)
+    return grouped
 
 
 # =========================

@@ -166,3 +166,37 @@ class UserStorageResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+# ============== PORT / APP ACCESS ==============
+
+class InstancePortCreate(BaseModel):
+    port: int
+    target_port: Optional[int] = None
+    protocol: Optional[str] = "TCP"
+
+
+class InstancePortResponse(BaseModel):
+    id: int
+    instance_id: int
+    port: int
+    target_port: int
+    node_port: Optional[int] = None
+    protocol: str
+    service_name: str
+    launch_url: Optional[str] = None
+    status: str
+
+    class Config:
+        from_attributes = True
+
+
+class BillingUsageRawResponse(BaseModel):
+    instance_id: int
+    pod_name: str
+    user_id: int
+    project_id: Optional[int] = None
+    status: str
+    accumulated_cost: float
+    estimated_hours: Optional[float] = None
+    estimated_amount: Optional[float] = None

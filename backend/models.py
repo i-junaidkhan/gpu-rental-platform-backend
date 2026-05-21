@@ -79,6 +79,23 @@ class Instance(Base):
     project = relationship("Project", back_populates="instances")
     plan = relationship("RentalPlan")
 
+
+class InstancePort(Base):
+    __tablename__ = "instance_ports"
+
+    id = Column(Integer, primary_key=True, index=True)
+    instance_id = Column(Integer, ForeignKey("instances.id"), nullable=False)
+    port = Column(Integer, nullable=False)
+    target_port = Column(Integer, nullable=False)
+    node_port = Column(Integer, nullable=True)
+    protocol = Column(String, default="TCP", nullable=False)
+    service_name = Column(String, nullable=False)
+    launch_url = Column(String, nullable=True)
+    status = Column(String, default="open", nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    instance = relationship("Instance")
+
 class BillingEvent(Base):
     __tablename__ = "billing_events"
 

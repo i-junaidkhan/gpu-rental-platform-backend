@@ -61,6 +61,23 @@ def run_safe_projects_migration(connection):
         WHERE us.project_id IS NULL
     """))
 
+
+    # Batch 5: port/app access records for NodePort services.
+    connection.execute(text("""
+        CREATE TABLE IF NOT EXISTS instance_ports (
+            id SERIAL PRIMARY KEY,
+            instance_id INTEGER NOT NULL,
+            port INTEGER NOT NULL,
+            target_port INTEGER NOT NULL,
+            node_port INTEGER NULL,
+            protocol VARCHAR DEFAULT 'TCP' NOT NULL,
+            service_name VARCHAR NOT NULL,
+            launch_url VARCHAR NULL,
+            status VARCHAR DEFAULT 'open' NOT NULL,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        )
+    """))
+
     logger.info("Safe projects migration complete.")
 
 
