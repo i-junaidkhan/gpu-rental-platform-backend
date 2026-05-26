@@ -88,6 +88,20 @@ def k8s_raw_request(method: str, path: str, body: dict | None = None) -> dict:
         raise HTTPException(status_code=500, detail=f"Kubernetes raw API request failed: {e}")
 
 
+
+
+def k8s_raw_request_text(method: str, path: str) -> str:
+    url = _k8s_raw_base() + path
+    req = urllib.request.Request(url, method=method.upper())
+    req.add_header("Authorization", f"Bearer {_k8s_raw_token()}")
+    try:
+        with urllib.request.urlopen(req, context=_k8s_raw_ssl_context(), timeout=20) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
+        logger.error(f"Kubernetes raw text API error {e.code} for {path}: {error_body}")
+        raise HTTPException(status_code=e.code, detail=f"Kubernetes error: {error_body}")
+
 def k8s_raw_list_nodes() -> list[dict]:
     return k8s_raw_request("GET", "/api/v1/nodes").get("items", [])
 
@@ -116,6 +130,32 @@ def k8s_raw_list_services(namespace: str | None = None) -> list[dict]:
     else:
         path = "/api/v1/services"
     return k8s_raw_request("GET", path).get("items", [])
+
+
+def k8s_raw_read_pod(namespace: str, pod_name: str) -> dict:
+    return k8s_raw_request("GET", f"/api/v1/namespaces/{urllib.parse.quote(namespace)}/pods/{urllib.parse.quote(pod_name)}")
+
+
+def k8s_raw_read_service(namespace: str, service_name: str) -> dict:
+    return k8s_raw_request("GET", f"/api/v1/namespaces/{urllib.parse.quote(namespace)}/services/{urllib.parse.quote(service_name)}")
+
+
+def k8s_raw_create_pod(namespace: str, manifest) -> dict:
+    body = client.ApiClient().sanitize_for_serialization(manifest)
+    return k8s_raw_request("POST", f"/api/v1/namespaces/{urllib.parse.quote(namespace)}/pods", body=body)
+
+
+def k8s_raw_delete_pod(namespace: str, pod_name: str) -> dict:
+    return k8s_raw_request("DELETE", f"/api/v1/namespaces/{urllib.parse.quote(namespace)}/pods/{urllib.parse.quote(pod_name)}", body={})
+
+
+def k8s_raw_create_service(namespace: str, service) -> dict:
+    body = client.ApiClient().sanitize_for_serialization(service)
+    return k8s_raw_request("POST", f"/api/v1/namespaces/{urllib.parse.quote(namespace)}/services", body=body)
+
+
+def k8s_raw_delete_service(namespace: str, service_name: str) -> dict:
+    return k8s_raw_request("DELETE", f"/api/v1/namespaces/{urllib.parse.quote(namespace)}/services/{urllib.parse.quote(service_name)}", body={})
 
 
 def _raw_ts(meta: dict) -> str | None:
@@ -528,6 +568,8 @@ ALLOWED_INSTANCE_IMAGES = {
     "docker.io/tensorflow/tensorflow:2.13.0-gpu",
     "jupyter/tensorflow-notebook:latest",
     "docker.io/jupyter/tensorflow-notebook:latest",
+    "jupyter/minimal-notebook:latest",
+    "docker.io/jupyter/minimal-notebook:latest",
 }
 
 def normalize_and_validate_image(image: str) -> str:
@@ -549,11 +591,21 @@ def validate_project_exists(db: Session, project_id: int):
         raise HTTPException(status_code=404, detail="Project not found")
     return project
 
-def get_instance_command(app_type: str | None):
-    # Keep runtime safe: all modes start a long-running container for now.
-    # Real Jupyter/VSCode launch needs image-specific commands and service exposure.
+def get_instance_command(app_type: str | None, token: str | None = None) -> list[str]:
+    app = (app_type or "terminal").lower()
+    safe_token = token or uuid.uuid4().hex
+    if app == "jupyter":
+        return [
+            "start-notebook.py",
+            f"--IdentityProvider.token={safe_token}",
+            "--ServerApp.allow_origin=*",
+            "--ServerApp.ip=0.0.0.0",
+            "--ServerApp.port=8888",
+            "--ServerApp.root_dir=/home/jovyan/workspace",
+        ]
+    if app == "vscode":
+        return ["code-server", "--bind-addr", "0.0.0.0:8080", "--auth", "none", "/workspace"]
     return ["sleep", "infinity"]
-
 
 
 def app_default_port(app_type: str | None) -> int:
@@ -567,10 +619,25 @@ def app_default_port(app_type: str | None) -> int:
     return 8888
 
 
-def build_launch_url(node_ip: str, node_port: int, app_type: str | None = None) -> str:
-    scheme = "ssh" if (app_type or "").lower() == "ssh" else "http"
-    return f"{scheme}://{node_ip}:{node_port}"
+def infer_app_type_from_port(target_port: int | None, explicit_app_type: str | None = None) -> str:
+    if explicit_app_type:
+        return explicit_app_type.lower()
+    if int(target_port or 0) == 8888:
+        return "jupyter"
+    if int(target_port or 0) == 8080:
+        return "vscode"
+    if int(target_port or 0) == 22:
+        return "ssh"
+    return "terminal"
 
+
+def build_launch_url(node_ip: str, node_port: int, app_type: str | None = None, token: str | None = None) -> str:
+    app = (app_type or "terminal").lower()
+    scheme = "ssh" if app == "ssh" else "http"
+    base_url = f"{scheme}://{node_ip}:{node_port}"
+    if app == "jupyter":
+        return f"{base_url}/lab?token={token or ''}"
+    return base_url
 
 def get_node_external_ip(node_name: str = "g01") -> str:
     try:
@@ -606,6 +673,125 @@ def calculate_resource_usage(node_name: str, resource_name: str) -> dict:
 
 
 
+def provision_workspace_subpath(project_id: int, user_id: int, storage_id: int | None = None) -> tuple[str, str]:
+    """Create and chmod the NFS workspace folder from inside the backend pod.
+
+    Returns (sub_path, physical_path). sub_path is used by Kubernetes PVC volumeMount.subPath.
+    """
+    if storage_id is not None:
+        sub_path = f"project_{project_id}/user_{user_id}/storage_{storage_id}"
+    else:
+        sub_path = f"project_{project_id}/user_{user_id}/default_workspace"
+    physical_path = os.path.join("/mnt/gpu-rental-storage", sub_path)
+    try:
+        os.makedirs(physical_path, exist_ok=True)
+        os.chmod(physical_path, 0o777)
+    except Exception as e:
+        logger.error(f"Failed to provision NFS workspace {physical_path}: {e}")
+        raise HTTPException(status_code=500, detail=f"Storage provisioning failed: {e}")
+    return sub_path, physical_path
+
+
+def build_instance_pod_manifest(
+    db: Session,
+    project,
+    user,
+    plan,
+    safe_image: str,
+    pod_name: str,
+    instance_payload=None,
+    instance_obj=None,
+):
+    namespace = "gpu-rental-system"
+    node_name = "g01"
+    resource_name = plan.k8s_resource_name
+    requested_count = int(plan.resource_count)
+
+    limits = {resource_name: str(requested_count)}
+    requests = {}
+
+    cpu_cores = getattr(instance_payload, "cpu_cores", None)
+    memory_gb = getattr(instance_payload, "memory_gb", None)
+    shm_gb = getattr(instance_payload, "shm_gb", None)
+    storage_id = getattr(instance_payload, "storage_id", None)
+    app_type = getattr(instance_payload, "app_type", None) or "terminal"
+
+    if cpu_cores is not None:
+        limits["cpu"] = str(cpu_cores)
+        requests["cpu"] = str(cpu_cores)
+    if memory_gb is not None:
+        limits["memory"] = f"{memory_gb}Gi"
+        requests["memory"] = f"{memory_gb}Gi"
+
+    volumes = []
+    volume_mounts = []
+    pvc_name = "mock-pvc-for-now"
+
+    # Real NFS workspace storage: mount the existing RWX PVC and isolate by subPath.
+    # For Jupyter/VSCode, always provide a persistent workspace. For terminal, only if storage selected.
+    should_mount_workspace = storage_id is not None or (app_type or "").lower() in ["jupyter", "vscode"]
+    if should_mount_workspace:
+        if storage_id is not None:
+            storage = db.query(models.UserStorage).filter(models.UserStorage.id == storage_id).first()
+            if not storage:
+                raise HTTPException(status_code=404, detail="Storage allocation not found")
+            if storage.user_id != user.id or storage.project_id != project.id:
+                raise HTTPException(status_code=403, detail="Storage allocation does not belong to this user/project")
+        sub_path, _physical_path = provision_workspace_subpath(project.id, user.id, storage_id)
+        pvc_name = "gpu-rental-storage-pvc"
+        volumes.append(
+            client.V1Volume(
+                name="workspace-storage",
+                persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(claim_name=pvc_name),
+            )
+        )
+        mount_target = "/home/jovyan/workspace" if (app_type or "").lower() == "jupyter" else "/workspace"
+        volume_mounts.append(
+            client.V1VolumeMount(name="workspace-storage", mount_path=mount_target, sub_path=sub_path)
+        )
+
+    if shm_gb is not None and shm_gb > 0:
+        volumes.append(
+            client.V1Volume(
+                name="dshm",
+                empty_dir=client.V1EmptyDirVolumeSource(medium="Memory", size_limit=f"{shm_gb}Gi"),
+            )
+        )
+        volume_mounts.append(client.V1VolumeMount(name="dshm", mount_path="/dev/shm"))
+
+    pod_manifest = client.V1Pod(
+        metadata=client.V1ObjectMeta(
+            name=pod_name,
+            labels={
+                "app": "gpu-tenant-instance",
+                "pod_name": pod_name,
+                "user_id": str(user.id),
+                "project_id": str(project.id),
+                "plan_id": str(plan.id),
+                "billing": "true",
+                "app_type": str(app_type or "terminal"),
+            },
+        ),
+        spec=client.V1PodSpec(
+            node_name=node_name,
+            restart_policy="Never",
+            volumes=volumes or None,
+            containers=[
+                client.V1Container(
+                    name="ai-workspace",
+                    image=safe_image,
+                    image_pull_policy="IfNotPresent",
+                    command=get_instance_command(app_type, pod_name),
+                    volume_mounts=volume_mounts or None,
+                    ports=[client.V1ContainerPort(container_port=app_default_port(app_type))] if app_type else None,
+                    resources=client.V1ResourceRequirements(limits=limits, requests=requests or None),
+                )
+            ],
+        ),
+    )
+    return pod_manifest, pvc_name
+
+
 @app.post("/api/instances", response_model=InstanceResponse)
 def create_instance(instance: InstanceCreate, db: Session = Depends(get_db)):
     user = db.query(models.User).filter(models.User.id == instance.user_id).first()
@@ -618,24 +804,23 @@ def create_instance(instance: InstanceCreate, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Plan not found")
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    if user.project_id is not None and user.project_id != project.id:
+        raise HTTPException(status_code=403, detail="User does not belong to the requested project")
 
-    # PHASE 2A: GPU Quota Enforcement
     requested_count = int(plan.resource_count)
-    
     current_instances = db.query(models.Instance).filter(
         models.Instance.project_id == project.id,
-        models.Instance.status.in_([models.InstanceStatusEnum.RUNNING, models.InstanceStatusEnum.PENDING])
+        models.Instance.status.in_([models.InstanceStatusEnum.RUNNING, models.InstanceStatusEnum.PENDING]),
     ).all()
 
     current_gpu_usage = 0
     for inst in current_instances:
         inst_plan = db.query(models.RentalPlan).filter(models.RentalPlan.id == inst.plan_id).first()
         if inst_plan:
-            current_gpu_usage += inst_plan.resource_count
+            current_gpu_usage += int(inst_plan.resource_count or 0)
 
-    # Quota Logic: 0 means unlimited ONLY for default-project (id 1)
     if project.id == 1 and project.max_gpu_count == 0:
-        pass  # Unlimited bypass for default project
+        pass
     elif (current_gpu_usage + requested_count) > project.max_gpu_count:
         raise HTTPException(
             status_code=409,
@@ -643,133 +828,41 @@ def create_instance(instance: InstanceCreate, db: Session = Depends(get_db)):
                 "message": f"Project '{project.name}' GPU quota exceeded.",
                 "max_allowed": project.max_gpu_count,
                 "currently_using": current_gpu_usage,
-                "requested": requested_count
-            }
+                "requested": requested_count,
+            },
         )
 
-    # --- YOUR EXISTING K8s LOGIC REMAINS UNTOUCHED ---
     namespace = "gpu-rental-system"
     node_name = "g01"
     resource_name = plan.k8s_resource_name
     safe_image = normalize_and_validate_image(instance.image)
+    usage = calculate_resource_usage(node_name, resource_name)
+    if usage["free"] < requested_count:
+        raise HTTPException(status_code=409, detail=f"No available Kubernetes capacity for {resource_name}")
+
+    pod_name = f"gpu-p{project.id}-u{user.id}-{uuid.uuid4().hex[:6]}"
 
     try:
-        v1 = k8s_v1
-        usage = calculate_resource_usage(node_name, resource_name)
-
-        if usage["free"] < requested_count:
-            raise HTTPException(
-                status_code=409,
-                detail=f"No available Kubernetes capacity for {resource_name}"
-            )
-
-        short_uuid = uuid.uuid4().hex[:6]
-        pod_name = f"gpu-p{project.id}-u{user.id}-{short_uuid}"
-
-        limits = {resource_name: str(requested_count)}
-        requests = {}
-
-        if instance.cpu_cores is not None:
-            cpu_value = str(instance.cpu_cores)
-            limits["cpu"] = cpu_value
-            requests["cpu"] = cpu_value
-
-        if instance.memory_gb is not None:
-            mem_value = f"{instance.memory_gb}Gi"
-            limits["memory"] = mem_value
-            requests["memory"] = mem_value
-
-        volumes = []
-        volume_mounts = []
-        pvc_name = "mock-pvc-for-now"
-
-        if instance.storage_id is not None:
-            storage = db.query(models.UserStorage).filter(models.UserStorage.id == instance.storage_id).first()
-            if not storage:
-                raise HTTPException(status_code=404, detail="Storage allocation not found")
-            if storage.user_id != user.id or storage.project_id != project.id:
-                raise HTTPException(status_code=403, detail="Storage allocation does not belong to this user/project")
-            pvc_name = f"user-storage-{storage.id}"
-            volumes.append(
-                client.V1Volume(
-                    name="workspace-storage",
-                    host_path=client.V1HostPathVolumeSource(
-                        path=storage.folder_path,
-                        type="DirectoryOrCreate"
-                    )
-                )
-            )
-            volume_mounts.append(
-                client.V1VolumeMount(
-                    name="workspace-storage",
-                    mount_path="/workspace"
-                )
-            )
-
-        if instance.shm_gb is not None and instance.shm_gb > 0:
-            volumes.append(
-                client.V1Volume(
-                    name="dshm",
-                    empty_dir=client.V1EmptyDirVolumeSource(
-                        medium="Memory",
-                        size_limit=f"{instance.shm_gb}Gi"
-                    )
-                )
-            )
-            volume_mounts.append(
-                client.V1VolumeMount(
-                    name="dshm",
-                    mount_path="/dev/shm"
-                )
-            )
-
-        pod_manifest = client.V1Pod(
-            metadata=client.V1ObjectMeta(
-                name=pod_name,
-                labels={
-                    "app": "gpu-tenant-instance",
-                    "user_id": str(user.id),
-                    "project_id": str(project.id),
-                    "plan_id": str(plan.id),
-                    "billing": "true",
-                    "app_type": str(instance.app_type or "terminal"),
-                },
-            ),
-            spec=client.V1PodSpec(
-                node_name=node_name,
-                restart_policy="Never",
-                volumes=volumes or None,
-                containers=[
-                    client.V1Container(
-                        name="ai-workspace",
-                        image=safe_image,
-                        command=get_instance_command(instance.app_type),
-                        volume_mounts=volume_mounts or None,
-                        resources=client.V1ResourceRequirements(
-                            limits=limits,
-                            requests=requests or None,
-                        ),
-                    )
-                ],
-            ),
+        pod_manifest, pvc_name = build_instance_pod_manifest(
+            db=db,
+            project=project,
+            user=user,
+            plan=plan,
+            safe_image=safe_image,
+            pod_name=pod_name,
+            instance_payload=instance,
         )
-
-        v1.create_namespaced_pod(namespace=namespace, body=pod_manifest)
+        k8s_raw_create_pod(namespace=namespace, manifest=pod_manifest)
         logger.info(f"Created pod {pod_name} using {resource_name}:{requested_count} for project {project.id}")
-
     except HTTPException:
         raise
-    except client.exceptions.ApiException as e:
-        logger.error(f"Kubernetes pod creation failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Kubernetes pod creation failed: {e.reason}")
     except Exception as e:
         logger.error(f"Unexpected instance creation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-    # --- SAVE TO DB (NOW WITH PROJECT ID) ---
     db_instance = models.Instance(
         user_id=user.id,
-        project_id=project.id,  # Added project binding
+        project_id=project.id,
         plan_id=plan.id,
         pod_name=pod_name,
         namespace=namespace,
@@ -786,7 +879,7 @@ def create_instance(instance: InstanceCreate, db: Session = Depends(get_db)):
         db.rollback()
         logger.error(f"Database error saving instance: {e}")
         try:
-            v1.delete_namespaced_pod(name=pod_name, namespace=namespace)
+            k8s_raw_delete_pod(namespace=namespace, pod_name=pod_name)
         except Exception:
             pass
         raise HTTPException(status_code=500, detail="Pod created but DB save failed; cleanup attempted")
@@ -800,13 +893,12 @@ def delete_instance(instance_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Instance not found")
 
     try:
-        v1 = k8s_v1
-        v1.delete_namespaced_pod(name=instance.pod_name, namespace=instance.namespace)
+        k8s_raw_delete_pod(namespace=instance.namespace, pod_name=instance.pod_name)
         logger.info(f"Deleted pod {instance.pod_name}")
-    except client.exceptions.ApiException as e:
-        if e.status != 404:
-            logger.error(f"Failed to delete pod {instance.pod_name}: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to delete pod: {e.reason}")
+    except HTTPException as e:
+        if e.status_code != 404:
+            logger.error(f"Failed to delete pod {instance.pod_name}: {e.detail}")
+            raise
 
     instance.status = models.InstanceStatusEnum.DELETED
     db.commit()
@@ -817,92 +909,57 @@ def delete_instance(instance_id: int, db: Session = Depends(get_db)):
 @app.post("/api/instances/{instance_id}/action")
 def instance_action(instance_id: int, payload: dict, db: Session = Depends(get_db)):
     instance = db.query(models.Instance).filter(models.Instance.id == instance_id).first()
-
     if not instance:
         raise HTTPException(status_code=404, detail="Instance not found")
 
     action = payload.get("action", "").lower().strip()
-
     if action not in ["start", "stop", "restart"]:
         raise HTTPException(status_code=400, detail="Invalid action")
 
-    v1 = k8s_v1
-
     if action in ["stop", "restart"]:
         try:
-            v1.delete_namespaced_pod(name=instance.pod_name, namespace=instance.namespace)
-        except client.exceptions.ApiException as e:
-            if e.status != 404:
-                raise HTTPException(status_code=500, detail=f"Failed to stop pod: {e.reason}")
-
+            k8s_raw_delete_pod(namespace=instance.namespace, pod_name=instance.pod_name)
+        except HTTPException as e:
+            if e.status_code != 404:
+                raise
         instance.status = models.InstanceStatusEnum.STOPPED
         db.commit()
-
         if action == "stop":
             return {"message": "Instance stopped", "id": instance.id, "pod_name": instance.pod_name, "status": instance.status.value}
 
     if action in ["start", "restart"]:
+        # Historical DB rows do not store original image/app/storage selections.
+        # Recreate safely as a terminal pod with the existing plan. New app instances should be created through POST /api/instances.
         plan = db.query(models.RentalPlan).filter(models.RentalPlan.id == instance.plan_id).first()
-
-        if not plan:
-            raise HTTPException(status_code=404, detail="Plan not found")
+        user = db.query(models.User).filter(models.User.id == instance.user_id).first()
+        project = db.query(models.Project).filter(models.Project.id == instance.project_id).first()
+        if not plan or not user or not project:
+            raise HTTPException(status_code=404, detail="Plan/user/project not found for instance")
 
         node_name = "g01"
         resource_name = plan.k8s_resource_name
         requested_count = int(plan.resource_count)
-
         usage = calculate_resource_usage(node_name, resource_name)
-
         if usage["free"] < requested_count:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "message": f"No available capacity for {resource_name}",
-                    "resource": resource_name,
-                    "capacity": usage["capacity"],
-                    "used": usage["used"],
-                    "free": usage["free"],
-                    "requested": requested_count,
-                },
-            )
+            raise HTTPException(status_code=409, detail={"message": f"No available capacity for {resource_name}", **usage, "requested": requested_count})
 
-        image = "docker.io/nvidia/cuda:12.4.0-base-ubuntu22.04"
-
-        pod_manifest = client.V1Pod(
-            metadata=client.V1ObjectMeta(
-                name=instance.pod_name,
-                labels={
-                    "app": "gpu-tenant-instance",
-                    "user_id": str(instance.user_id),
-                    "plan_id": str(instance.plan_id),
-                    "billing": "true",
-                },
-            ),
-            spec=client.V1PodSpec(
-                node_name=node_name,
-                restart_policy="Never",
-                containers=[
-                    client.V1Container(
-                        name="ai-workspace",
-                        image=image,
-                        command=["sleep", "infinity"],
-                        resources=client.V1ResourceRequirements(
-                            limits={resource_name: str(requested_count)}
-                        ),
-                    )
-                ],
-            ),
+        safe_image = "docker.io/library/ubuntu:22.04"
+        pod_manifest, pvc_name = build_instance_pod_manifest(
+            db=db,
+            project=project,
+            user=user,
+            plan=plan,
+            safe_image=safe_image,
+            pod_name=instance.pod_name,
+            instance_payload=None,
+            instance_obj=instance,
         )
-
-        try:
-            v1.create_namespaced_pod(namespace=instance.namespace, body=pod_manifest)
-        except client.exceptions.ApiException as e:
-            raise HTTPException(status_code=500, detail=f"Failed to start pod: {e.reason}")
-
+        k8s_raw_create_pod(namespace=instance.namespace, manifest=pod_manifest)
+        instance.pvc_name = pvc_name
         instance.status = models.InstanceStatusEnum.RUNNING
         db.commit()
-
         return {"message": "Instance started", "id": instance.id, "pod_name": instance.pod_name, "status": instance.status.value}
+
 
 
 
@@ -926,7 +983,14 @@ def open_instance_port(instance_id: int, payload: InstancePortCreate, db: Sessio
     service_name = f"{instance.pod_name}-port-{exposed_port}".lower().replace("_", "-")[:63]
 
     try:
-        v1 = k8s_v1
+        # Infer app type from pod label when possible; fallback to target_port.
+        app_type = infer_app_type_from_port(target_port)
+        try:
+            pod = k8s_raw_read_pod(instance.namespace, instance.pod_name)
+            app_type = infer_app_type_from_port(target_port, (pod.get("metadata", {}).get("labels", {}) or {}).get("app_type"))
+        except Exception as e:
+            logger.warning(f"Could not read pod labels for app_type inference: {e}")
+
         service = client.V1Service(
             metadata=client.V1ObjectMeta(
                 name=service_name,
@@ -952,23 +1016,23 @@ def open_instance_port(instance_id: int, payload: InstancePortCreate, db: Sessio
         )
 
         try:
-            created = v1.create_namespaced_service(namespace=instance.namespace, body=service)
-        except client.exceptions.ApiException as e:
-            if e.status == 409:
-                created = v1.read_namespaced_service(name=service_name, namespace=instance.namespace)
+            created = k8s_raw_create_service(namespace=instance.namespace, service=service)
+        except HTTPException as e:
+            if e.status_code == 409:
+                created = k8s_raw_read_service(namespace=instance.namespace, service_name=service_name)
             else:
                 raise
 
-        node_port = None
-        if created.spec and created.spec.ports:
-            node_port = created.spec.ports[0].node_port
+        ports = created.get("spec", {}).get("ports", []) or []
+        node_port = ports[0].get("nodePort") if ports else None
+        if not node_port:
+            raise HTTPException(status_code=500, detail="Kubernetes failed to assign a NodePort")
 
         node_ip = get_node_external_ip("g01")
-        launch_url = build_launch_url(node_ip, node_port, None) if node_port else None
+        launch_url = build_launch_url(node_ip, node_port, app_type, instance.pod_name)
 
-    except client.exceptions.ApiException as e:
-        logger.error(f"Failed to open service port for instance {instance_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Kubernetes service creation failed: {e.reason}")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Unexpected port open error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1019,11 +1083,10 @@ def close_instance_port(instance_id: int, port_id: int, db: Session = Depends(ge
         raise HTTPException(status_code=404, detail="Port record not found")
 
     try:
-        v1 = k8s_v1
-        v1.delete_namespaced_service(name=port_row.service_name, namespace=instance.namespace)
-    except client.exceptions.ApiException as e:
-        if e.status != 404:
-            raise HTTPException(status_code=500, detail=f"Failed to delete service: {e.reason}")
+        k8s_raw_delete_service(namespace=instance.namespace, service_name=port_row.service_name)
+    except HTTPException as e:
+        if e.status_code != 404:
+            raise
 
     port_row.status = "closed"
     db.commit()
@@ -1227,13 +1290,13 @@ def get_node_resources(node_name: str):
 @app.get("/api/pods/{namespace}/{pod_name}/logs")
 def get_pod_logs(namespace: str, pod_name: str, tail_lines: int = 100):
     try:
-        logs = k8s_v1.read_namespaced_pod_log(name=pod_name, namespace=namespace, tail_lines=tail_lines)
-        return {"logs": logs}
-    except client.exceptions.ApiException as e:
-        if e.status in [400, 404]:
-            return {"logs": "", "message": f"Logs unavailable: {e.reason}"}
-        logger.error(f"Failed to fetch logs for {pod_name}: {e}")
-        raise HTTPException(status_code=e.status, detail=f"Kubernetes error: {e.reason}")
+        path = f"/api/v1/namespaces/{urllib.parse.quote(namespace)}/pods/{urllib.parse.quote(pod_name)}/log?tailLines={int(tail_lines)}"
+        return {"logs": k8s_raw_request_text("GET", path)}
+    except HTTPException as e:
+        if e.status_code in [400, 404]:
+            return {"logs": "", "message": f"Logs unavailable: {e.detail}"}
+        raise
+
 
 
 # =========================
@@ -1293,12 +1356,12 @@ def get_services(namespace: str = None):
 @app.delete("/api/pods/{namespace}/{pod_name}")
 def delete_pod(namespace: str, pod_name: str):
     try:
-        k8s_v1.delete_namespaced_pod(name=pod_name, namespace=namespace)
+        k8s_raw_delete_pod(namespace=namespace, pod_name=pod_name)
         return {"message": "Pod deleted", "namespace": namespace, "pod_name": pod_name}
-    except client.exceptions.ApiException as e:
-        if e.status == 404:
+    except HTTPException as e:
+        if e.status_code == 404:
             return {"message": "Pod already missing", "namespace": namespace, "pod_name": pod_name}
-        raise HTTPException(status_code=e.status, detail=f"Kubernetes error: {e.reason}")
+        raise
 
 
 @app.get("/api/gpu-inventory")
