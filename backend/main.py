@@ -1,5 +1,11 @@
 import logging
 import uuid
+import os
+import json
+import ssl
+import urllib.request
+import urllib.parse
+import urllib.error
 
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -35,11 +41,176 @@ from schemas import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+# =========================
+# Raw Kubernetes API helper
+# =========================
+# The installed kubernetes Python client authenticates as system:anonymous in this cluster.
+# Direct urllib requests with the same ServiceAccount token are proven to work, so all
+# dashboard/discovery read endpoints use this raw helper.
+
+def _k8s_raw_base():
+    host = os.environ.get("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc")
+    port = os.environ.get("KUBERNETES_SERVICE_PORT", "443")
+    return f"https://{host}:{port}"
+
+
+def _k8s_raw_token():
+    token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    with open(token_path) as f:
+        return f.read().strip()
+
+
+def _k8s_raw_ssl_context():
+    ca_path = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+    ctx = ssl.create_default_context()
+    ctx.load_verify_locations(ca_path)
+    return ctx
+
+
+def k8s_raw_request(method: str, path: str, body: dict | None = None) -> dict:
+    url = _k8s_raw_base() + path
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method=method.upper())
+    req.add_header("Authorization", f"Bearer {_k8s_raw_token()}")
+    req.add_header("Accept", "application/json")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, context=_k8s_raw_ssl_context(), timeout=20) as resp:
+            raw = resp.read()
+            return json.loads(raw.decode("utf-8")) if raw else {}
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
+        logger.error(f"Kubernetes raw API error {e.code} for {path}: {error_body}")
+        raise HTTPException(status_code=e.code, detail=f"Kubernetes error: {error_body}")
+    except Exception as e:
+        logger.error(f"Kubernetes raw API request failed for {path}: {e}")
+        raise HTTPException(status_code=500, detail=f"Kubernetes raw API request failed: {e}")
+
+
+def k8s_raw_list_nodes() -> list[dict]:
+    return k8s_raw_request("GET", "/api/v1/nodes").get("items", [])
+
+
+def k8s_raw_read_node(name: str) -> dict:
+    return k8s_raw_request("GET", f"/api/v1/nodes/{urllib.parse.quote(name)}")
+
+
+def k8s_raw_list_namespaces() -> list[dict]:
+    return k8s_raw_request("GET", "/api/v1/namespaces").get("items", [])
+
+
+def k8s_raw_list_pods(namespace: str | None = None, field_selector: str | None = None) -> list[dict]:
+    if namespace:
+        path = f"/api/v1/namespaces/{urllib.parse.quote(namespace)}/pods"
+    else:
+        path = "/api/v1/pods"
+    if field_selector:
+        path += "?fieldSelector=" + urllib.parse.quote(field_selector)
+    return k8s_raw_request("GET", path).get("items", [])
+
+
+def k8s_raw_list_services(namespace: str | None = None) -> list[dict]:
+    if namespace:
+        path = f"/api/v1/namespaces/{urllib.parse.quote(namespace)}/services"
+    else:
+        path = "/api/v1/services"
+    return k8s_raw_request("GET", path).get("items", [])
+
+
+def _raw_ts(meta: dict) -> str | None:
+    return (meta or {}).get("creationTimestamp")
+
+
+def _raw_node_conditions(node: dict) -> dict:
+    return {c.get("type"): c.get("status") for c in node.get("status", {}).get("conditions", [])}
+
+
+def raw_node_to_dict(node: dict) -> dict:
+    meta = node.get("metadata", {})
+    status = node.get("status", {})
+    labels = meta.get("labels", {}) or {}
+    capacity = status.get("capacity", {}) or {}
+    allocatable = status.get("allocatable", {}) or {}
+    conditions = _raw_node_conditions(node)
+    return {
+        "name": meta.get("name"),
+        "status": "Ready" if conditions.get("Ready") == "True" else "NotReady",
+        "ready": conditions.get("Ready") == "True",
+        "roles": labels,
+        "cpu": allocatable.get("cpu") or capacity.get("cpu"),
+        "memory": allocatable.get("memory") or capacity.get("memory"),
+        "gpu": allocatable.get("nvidia.com/gpu", capacity.get("nvidia.com/gpu", "0")),
+        "mig_1g_10gb": allocatable.get("nvidia.com/mig-1g.10gb", capacity.get("nvidia.com/mig-1g.10gb", "0")),
+        "capacity": capacity,
+        "allocatable": allocatable,
+        "labels": labels,
+        "internal_ip": next((a.get("address") for a in status.get("addresses", []) if a.get("type") == "InternalIP"), None),
+        "created_at": _raw_ts(meta),
+    }
+
+
+def raw_pod_to_dict(pod: dict) -> dict:
+    meta = pod.get("metadata", {})
+    status = pod.get("status", {})
+    spec = pod.get("spec", {})
+    return {
+        "name": meta.get("name"),
+        "namespace": meta.get("namespace"),
+        "status": status.get("phase"),
+        "node": spec.get("nodeName"),
+        "pod_ip": status.get("podIP"),
+        "host_ip": status.get("hostIP"),
+        "labels": meta.get("labels", {}) or {},
+        "created_at": _raw_ts(meta),
+    }
+
+
+def raw_service_to_dict(svc: dict) -> dict:
+    meta = svc.get("metadata", {})
+    spec = svc.get("spec", {})
+    return {
+        "name": meta.get("name"),
+        "namespace": meta.get("namespace"),
+        "type": spec.get("type"),
+        "cluster_ip": spec.get("clusterIP"),
+        "ports": [
+            {
+                "name": p.get("name"),
+                "port": p.get("port"),
+                "target_port": str(p.get("targetPort")),
+                "node_port": p.get("nodePort"),
+                "protocol": p.get("protocol"),
+            }
+            for p in spec.get("ports", [])
+        ],
+    }
+
+# Kubernetes client setup with manual token configuration (fixes kubernetes-client v36.0.0 bug)
+# Create a GLOBAL k8s_v1 client that all endpoints will use
+k8s_v1 = None
+
 try:
-    config.load_incluster_config()
-    logger.info("Loaded in-cluster Kubernetes config.")
-except config.ConfigException:
-    logger.warning("Could not load in-cluster Kubernetes config.")
+    token_path = '/var/run/secrets/kubernetes.io/serviceaccount/token'
+    if os.path.exists(token_path):
+        with open(token_path) as f:
+            token = f.read().strip()
+        configuration = client.Configuration()
+        configuration.api_key['authorization'] = token
+        configuration.api_key_prefix['authorization'] = 'Bearer'
+        k8s_host = os.environ.get('KUBERNETES_SERVICE_HOST', 'kubernetes.default.svc')
+        k8s_port = os.environ.get('KUBERNETES_SERVICE_PORT', '443')
+        configuration.host = f"https://{k8s_host}:{k8s_port}"
+        configuration.ssl_ca_cert = '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt'
+        api_client = client.ApiClient(configuration)
+        k8s_v1 = client.CoreV1Api(api_client)
+        logger.info("Loaded in-cluster Kubernetes config (manual token).")
+    else:
+        config.load_kube_config()
+        k8s_v1 = client.CoreV1Api()
+        logger.info("Loaded local kube config.")
+except Exception as e:
+    logger.warning(f"Could not load Kubernetes config: {e}")
 
 app = FastAPI(title="GPU Rental API", version="1.0.0")
 
@@ -80,6 +251,7 @@ def list_tables(db: Session = Depends(get_db)):
         )
     )
     return {"tables": [row[0] for row in result.fetchall()]}
+
 
 
 
@@ -400,31 +572,38 @@ def build_launch_url(node_ip: str, node_port: int, app_type: str | None = None) 
     return f"{scheme}://{node_ip}:{node_port}"
 
 
-def get_node_external_ip(v1: client.CoreV1Api, node_name: str = "g01") -> str:
+def get_node_external_ip(node_name: str = "g01") -> str:
     try:
-        node = v1.read_node(name=node_name)
-        for addr in node.status.addresses or []:
-            if addr.type in ["ExternalIP", "InternalIP"]:
-                return addr.address
-    except Exception:
-        pass
+        node = k8s_raw_read_node(node_name)
+        for addr in node.get("status", {}).get("addresses", []) or []:
+            if addr.get("type") in ["ExternalIP", "InternalIP"]:
+                return addr.get("address")
+    except Exception as e:
+        logger.warning(f"Failed to read node IP through raw Kubernetes API: {e}")
     return "192.168.10.226"
 
-def calculate_resource_usage(v1: client.CoreV1Api, node_name: str, resource_name: str) -> dict:
-    node = v1.read_node(name=node_name)
-    allocatable = node.status.allocatable or {}
-    capacity = int(allocatable.get(resource_name, "0"))
-    pods = v1.list_pod_for_all_namespaces(field_selector=f"spec.nodeName={node_name}")
+
+def calculate_resource_usage(node_name: str, resource_name: str) -> dict:
+    node = k8s_raw_read_node(node_name)
+    allocatable = node.get("status", {}).get("allocatable", {}) or {}
+    try:
+        capacity = int(allocatable.get(resource_name, "0"))
+    except Exception:
+        capacity = 0
+    pods = k8s_raw_list_pods(field_selector=f"spec.nodeName={node_name}")
     used = 0
-    for pod in pods.items:
-        if pod.status.phase in ["Succeeded", "Failed"]:
+    for pod in pods:
+        if pod.get("status", {}).get("phase") in ["Succeeded", "Failed"]:
             continue
-        for container in pod.spec.containers:
-            limits = container.resources.limits if container.resources and container.resources.limits else {}
+        for container in pod.get("spec", {}).get("containers", []) or []:
+            limits = container.get("resources", {}).get("limits", {}) or {}
             if resource_name in limits:
-                used += int(limits[resource_name])
-    free = capacity - used
-    return {"capacity": capacity, "used": used, "free": free}
+                try:
+                    used += int(limits.get(resource_name, 0))
+                except Exception:
+                    pass
+    return {"capacity": capacity, "used": used, "free": max(capacity - used, 0)}
+
 
 
 @app.post("/api/instances", response_model=InstanceResponse)
@@ -475,8 +654,8 @@ def create_instance(instance: InstanceCreate, db: Session = Depends(get_db)):
     safe_image = normalize_and_validate_image(instance.image)
 
     try:
-        v1 = client.CoreV1Api()
-        usage = calculate_resource_usage(v1, node_name, resource_name)
+        v1 = k8s_v1
+        usage = calculate_resource_usage(node_name, resource_name)
 
         if usage["free"] < requested_count:
             raise HTTPException(
@@ -621,7 +800,7 @@ def delete_instance(instance_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Instance not found")
 
     try:
-        v1 = client.CoreV1Api()
+        v1 = k8s_v1
         v1.delete_namespaced_pod(name=instance.pod_name, namespace=instance.namespace)
         logger.info(f"Deleted pod {instance.pod_name}")
     except client.exceptions.ApiException as e:
@@ -647,7 +826,7 @@ def instance_action(instance_id: int, payload: dict, db: Session = Depends(get_d
     if action not in ["start", "stop", "restart"]:
         raise HTTPException(status_code=400, detail="Invalid action")
 
-    v1 = client.CoreV1Api()
+    v1 = k8s_v1
 
     if action in ["stop", "restart"]:
         try:
@@ -672,7 +851,7 @@ def instance_action(instance_id: int, payload: dict, db: Session = Depends(get_d
         resource_name = plan.k8s_resource_name
         requested_count = int(plan.resource_count)
 
-        usage = calculate_resource_usage(v1, node_name, resource_name)
+        usage = calculate_resource_usage(node_name, resource_name)
 
         if usage["free"] < requested_count:
             raise HTTPException(
@@ -747,7 +926,7 @@ def open_instance_port(instance_id: int, payload: InstancePortCreate, db: Sessio
     service_name = f"{instance.pod_name}-port-{exposed_port}".lower().replace("_", "-")[:63]
 
     try:
-        v1 = client.CoreV1Api()
+        v1 = k8s_v1
         service = client.V1Service(
             metadata=client.V1ObjectMeta(
                 name=service_name,
@@ -784,7 +963,7 @@ def open_instance_port(instance_id: int, payload: InstancePortCreate, db: Sessio
         if created.spec and created.spec.ports:
             node_port = created.spec.ports[0].node_port
 
-        node_ip = get_node_external_ip(v1, "g01")
+        node_ip = get_node_external_ip("g01")
         launch_url = build_launch_url(node_ip, node_port, None) if node_port else None
 
     except client.exceptions.ApiException as e:
@@ -840,7 +1019,7 @@ def close_instance_port(instance_id: int, port_id: int, db: Session = Depends(ge
         raise HTTPException(status_code=404, detail="Port record not found")
 
     try:
-        v1 = client.CoreV1Api()
+        v1 = k8s_v1
         v1.delete_namespaced_service(name=port_row.service_name, namespace=instance.namespace)
     except client.exceptions.ApiException as e:
         if e.status != 404:
@@ -898,46 +1077,64 @@ def monitoring_pods(db: Session = Depends(get_db)):
 
 @app.get("/api/monitoring/nodes")
 def monitoring_nodes():
-    v1 = client.CoreV1Api()
-    nodes = v1.list_node().items
+    nodes = k8s_raw_list_nodes()
     result = []
     for node in nodes:
-        conditions = {c.type: c.status for c in (node.status.conditions or [])}
+        nd = raw_node_to_dict(node)
         result.append({
-            "name": node.metadata.name,
-            "ready": conditions.get("Ready") == "True",
-            "cpu": (node.status.capacity or {}).get("cpu"),
-            "memory": (node.status.capacity or {}).get("memory"),
-            "gpu": (node.status.capacity or {}).get("nvidia.com/gpu", "0"),
-            "internal_ip": next((a.address for a in node.status.addresses or [] if a.type == "InternalIP"), None),
+            "name": nd.get("name"),
+            "ready": nd.get("ready"),
+            "cpu": nd.get("capacity", {}).get("cpu"),
+            "memory": nd.get("capacity", {}).get("memory"),
+            "gpu": nd.get("capacity", {}).get("nvidia.com/gpu", "0"),
+            "internal_ip": nd.get("internal_ip"),
+            "status": nd.get("status"),
+            "labels": nd.get("labels", {}),
         })
     return result
 
-
 @app.get("/api/monitoring/gpus")
 def monitoring_gpus():
-    v1 = client.CoreV1Api()
-    nodes = v1.list_node().items
+    nodes = k8s_raw_list_nodes()
     rows = []
     for node in nodes:
-        capacity = node.status.capacity or {}
-        allocatable = node.status.allocatable or {}
-        labels = node.metadata.labels or {}
+        meta = node.get("metadata", {})
+        status = node.get("status", {})
+        labels = meta.get("labels", {}) or {}
+        capacity = status.get("capacity", {}) or {}
+        allocatable = status.get("allocatable", {}) or {}
+        found = False
         for key in sorted(set(list(capacity.keys()) + list(allocatable.keys()))):
             if key.startswith("nvidia.com/"):
-                cap = int(capacity.get(key, "0"))
-                alloc = int(allocatable.get(key, "0"))
+                found = True
+                try:
+                    cap = int(capacity.get(key, "0"))
+                except Exception:
+                    cap = 0
+                try:
+                    alloc = int(allocatable.get(key, "0"))
+                except Exception:
+                    alloc = 0
                 rows.append({
-                    "node_name": node.metadata.name,
+                    "node_name": meta.get("name"),
                     "resource_name": key,
                     "capacity": cap,
                     "allocatable": alloc,
-                    "product": labels.get("nvidia.com/gpu.product"),
+                    "product": labels.get("nvidia.com/gpu.product") or labels.get(f"{key}.product"),
                     "mig_strategy": labels.get("nvidia.com/mig.strategy"),
-                    "status": "available" if alloc > 0 else "unavailable",
+                    "status": "available" if alloc > 0 else "gpu_present_not_advertised",
                 })
+        if not found and (labels.get("feature.node.kubernetes.io/pci-10de.present") == "true" or labels.get("nvidia.com/gpu.present") == "true"):
+            rows.append({
+                "node_name": meta.get("name"),
+                "resource_name": "nvidia.com/gpu",
+                "capacity": 0,
+                "allocatable": 0,
+                "product": labels.get("nvidia.com/gpu.product"),
+                "mig_strategy": labels.get("nvidia.com/mig.strategy"),
+                "status": "gpu_present_not_advertised",
+            })
     return rows
-
 
 @app.get("/api/billing/usage/raw")
 def billing_usage_raw(db: Session = Depends(get_db)):
@@ -995,18 +1192,15 @@ def _group_by_project(rows):
 @app.get("/api/k8s/node-resources/{node_name}")
 def get_node_resources(node_name: str):
     try:
-        v1 = client.CoreV1Api()
-        node = v1.read_node(name=node_name)
-
-        capacity = node.status.capacity or {}
-        allocatable = node.status.allocatable or {}
-        labels = node.metadata.labels or {}
-
+        node = k8s_raw_read_node(node_name)
+        status = node.get("status", {})
+        capacity = status.get("capacity", {}) or {}
+        allocatable = status.get("allocatable", {}) or {}
+        labels = node.get("metadata", {}).get("labels", {}) or {}
         gpu_resources = {}
         for key in sorted(set(list(capacity.keys()) + list(allocatable.keys()))):
             if key.startswith("nvidia.com/"):
                 gpu_resources[key] = {"capacity": capacity.get(key, "0"), "allocatable": allocatable.get(key, "0")}
-
         return {
             "node": node_name,
             "gpu_resources": gpu_resources,
@@ -1024,18 +1218,16 @@ def get_node_resources(node_name: str):
                 "mig_1g_10gb_product": labels.get("nvidia.com/mig-1g.10gb.product"),
             },
         }
-    except client.exceptions.ApiException as e:
-        logger.error(f"Kubernetes API error: {e}")
-        raise HTTPException(status_code=e.status, detail=f"Kubernetes API error: {e.reason}")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to fetch node resources: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.get("/api/pods/{namespace}/{pod_name}/logs")
 def get_pod_logs(namespace: str, pod_name: str, tail_lines: int = 100):
     try:
-        logs = client.CoreV1Api().read_namespaced_pod_log(name=pod_name, namespace=namespace, tail_lines=tail_lines)
+        logs = k8s_v1.read_namespaced_pod_log(name=pod_name, namespace=namespace, tail_lines=tail_lines)
         return {"logs": logs}
     except client.exceptions.ApiException as e:
         if e.status in [400, 404]:
@@ -1081,64 +1273,27 @@ def node_to_dict(node):
 
 @app.get("/api/nodes")
 def get_nodes():
-    try:
-        nodes = client.CoreV1Api().list_node().items
-        return [node_to_dict(n) for n in nodes]
-    except client.exceptions.ApiException as e:
-        raise HTTPException(status_code=e.status, detail=f"Kubernetes error: {e.reason}")
-
+    return [raw_node_to_dict(n) for n in k8s_raw_list_nodes()]
 
 @app.get("/api/namespaces")
 def get_namespaces():
-    try:
-        namespaces = client.CoreV1Api().list_namespace().items
-        return [
-            {"name": ns.metadata.name, "status": ns.status.phase, "created_at": ns.metadata.creation_timestamp.isoformat() if ns.metadata.creation_timestamp else None}
-            for ns in namespaces
-        ]
-    except client.exceptions.ApiException as e:
-        raise HTTPException(status_code=e.status, detail=f"Kubernetes error: {e.reason}")
-
+    return [
+        {"name": ns.get("metadata", {}).get("name"), "status": ns.get("status", {}).get("phase"), "created_at": _raw_ts(ns.get("metadata", {}))}
+        for ns in k8s_raw_list_namespaces()
+    ]
 
 @app.get("/api/pods")
 def get_pods(namespace: str = None):
-    try:
-        v1 = client.CoreV1Api()
-        if namespace:
-            pods = v1.list_namespaced_pod(namespace=namespace).items
-        else:
-            pods = v1.list_pod_for_all_namespaces().items
-        return [pod_to_dict(p) for p in pods]
-    except client.exceptions.ApiException as e:
-        raise HTTPException(status_code=e.status, detail=f"Kubernetes error: {e.reason}")
-
+    return [raw_pod_to_dict(p) for p in k8s_raw_list_pods(namespace=namespace)]
 
 @app.get("/api/services")
 def get_services(namespace: str = None):
-    try:
-        v1 = client.CoreV1Api()
-        if namespace:
-            services = v1.list_namespaced_service(namespace=namespace).items
-        else:
-            services = v1.list_service_for_all_namespaces().items
-        return [
-            {
-                "name": svc.metadata.name,
-                "namespace": svc.metadata.namespace,
-                "type": svc.spec.type,
-                "cluster_ip": svc.spec.cluster_ip,
-                "ports": [{"name": p.name, "port": p.port, "target_port": str(p.target_port), "node_port": p.node_port, "protocol": p.protocol} for p in (svc.spec.ports or [])],
-            }
-            for svc in services
-        ]
-    except client.exceptions.ApiException as e:
-        raise HTTPException(status_code=e.status, detail=f"Kubernetes error: {e.reason}")
-
+    return [raw_service_to_dict(s) for s in k8s_raw_list_services(namespace=namespace)]
 
 @app.delete("/api/pods/{namespace}/{pod_name}")
 def delete_pod(namespace: str, pod_name: str):
     try:
-        client.CoreV1Api().delete_namespaced_pod(name=pod_name, namespace=namespace)
+        k8s_v1.delete_namespaced_pod(name=pod_name, namespace=namespace)
         return {"message": "Pod deleted", "namespace": namespace, "pod_name": pod_name}
     except client.exceptions.ApiException as e:
         if e.status == 404:
@@ -1149,57 +1304,46 @@ def delete_pod(namespace: str, pod_name: str):
 @app.get("/api/gpu-inventory")
 def get_gpu_inventory():
     try:
-        v1 = client.CoreV1Api()
-        node = v1.read_node(name="g01")
-
-        allocatable = node.status.allocatable or {}
-        capacity = node.status.capacity or {}
-
-        pods = v1.list_namespaced_pod(namespace="gpu-rental-system")
+        node = k8s_raw_read_node("g01")
+        status = node.get("status", {})
+        allocatable = status.get("allocatable", {}) or {}
+        capacity = status.get("capacity", {}) or {}
+        pods = k8s_raw_list_pods(namespace="gpu-rental-system")
         used = {"nvidia.com/gpu": 0, "nvidia.com/mig-1g.10gb": 0}
-
-        for pod in pods.items:
-            for container in pod.spec.containers:
-                limits = container.resources.limits
-                if limits:
-                    if "nvidia.com/gpu" in limits:
-                        used["nvidia.com/gpu"] += int(limits["nvidia.com/gpu"])
-                    if "nvidia.com/mig-1g.10gb" in limits:
-                        used["nvidia.com/mig-1g.10gb"] += int(limits["nvidia.com/mig-1g.10gb"])
-
-        resources = [
-            {
-                "id": 1,
+        for pod in pods:
+            for container in pod.get("spec", {}).get("containers", []) or []:
+                limits = container.get("resources", {}).get("limits", {}) or {}
+                for key in used:
+                    if key in limits:
+                        try:
+                            used[key] += int(limits[key])
+                        except Exception:
+                            pass
+        resources = []
+        for idx, (resource_name, display_name, resource_type) in enumerate([
+            ("nvidia.com/gpu", "A100 Shared Slot", "shared"),
+            ("nvidia.com/mig-1g.10gb", "A100 MIG 1g.10gb", "mig"),
+        ], start=1):
+            cap = int(capacity.get(resource_name, 0))
+            alloc = int(allocatable.get(resource_name, 0))
+            available = max(cap - used[resource_name], 0)
+            resources.append({
+                "id": idx,
                 "node_name": "g01",
-                "name": "A100 Shared Slot",
-                "resource_name": "nvidia.com/gpu",
-                "capacity": int(capacity.get("nvidia.com/gpu", 0)),
-                "used": used["nvidia.com/gpu"],
-                "available": int(capacity.get("nvidia.com/gpu", 0)) - used["nvidia.com/gpu"],
-                "allocatable": int(allocatable.get("nvidia.com/gpu", 0)),
-                "product": "NVIDIA-A100-80GB-PCIe-SHARED",
-                "type": "shared",
-                "status": "available" if (int(capacity.get("nvidia.com/gpu", 0)) - used["nvidia.com/gpu"]) > 0 else "unavailable"
-            },
-            {
-                "id": 2,
-                "node_name": "g01",
-                "name": "A100 MIG 1g.10gb",
-                "resource_name": "nvidia.com/mig-1g.10gb",
-                "capacity": int(capacity.get("nvidia.com/mig-1g.10gb", 0)),
-                "used": used["nvidia.com/mig-1g.10gb"],
-                "available": int(capacity.get("nvidia.com/mig-1g.10gb", 0)) - used["nvidia.com/mig-1g.10gb"],
-                "allocatable": int(allocatable.get("nvidia.com/mig-1g.10gb", 0)),
-                "product": "NVIDIA-A100-80GB-PCIe-MIG-1g.10gb",
-                "type": "mig",
-                "status": "available" if (int(capacity.get("nvidia.com/mig-1g.10gb", 0)) - used["nvidia.com/mig-1g.10gb"]) > 0 else "unavailable"
-            }
-        ]
+                "name": display_name,
+                "resource_name": resource_name,
+                "capacity": cap,
+                "used": used[resource_name],
+                "available": available,
+                "allocatable": alloc,
+                "product": "NVIDIA-A100-80GB-PCIe",
+                "type": resource_type,
+                "status": "available" if available > 0 else "gpu_present_not_advertised" if cap == 0 else "unavailable",
+            })
         return resources
     except Exception as e:
         logger.error(f"GPU inventory error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.get("/api/billing-events")
 def get_billing_events(db: Session = Depends(get_db)):
@@ -1235,46 +1379,37 @@ def create_billing_event(payload: dict, db: Session = Depends(get_db)):
 
 @app.get("/api/k8s/all-pods")
 def get_all_pods():
-    pods = client.CoreV1Api().list_pod_for_all_namespaces().items
-    return [pod_to_dict(p) for p in pods]
-
+    return [raw_pod_to_dict(p) for p in k8s_raw_list_pods()]
 
 @app.get("/api/k8s/gpu-pods")
 def get_gpu_pods():
-    pods = client.CoreV1Api().list_pod_for_all_namespaces().items
     result = []
-    for pod in pods:
+    for pod in k8s_raw_list_pods():
         uses_gpu = False
-        for container in pod.spec.containers:
-            limits = container.resources.limits if container.resources and container.resources.limits else {}
+        for container in pod.get("spec", {}).get("containers", []) or []:
+            limits = container.get("resources", {}).get("limits", {}) or {}
             if any(k.startswith("nvidia.com/") for k in limits.keys()):
                 uses_gpu = True
-        if uses_gpu or (pod.metadata.labels or {}).get("app") == "gpu-tenant-instance":
-            result.append(pod_to_dict(pod))
+        if uses_gpu or (pod.get("metadata", {}).get("labels", {}) or {}).get("app") == "gpu-tenant-instance":
+            result.append(raw_pod_to_dict(pod))
     return result
-
 
 @app.get("/api/k8s/node-summary/{node_name}")
 def get_node_summary(node_name: str):
     node_info = get_node_resources(node_name)
-    pods = client.CoreV1Api().list_pod_for_all_namespaces(field_selector=f"spec.nodeName={node_name}").items
+    pods = k8s_raw_list_pods(field_selector=f"spec.nodeName={node_name}")
     return {
         "node": node_name,
         "resources": node_info.get("gpu_resources", {}),
         "labels": node_info.get("labels", {}),
         "pod_count": len(pods),
-        "gpu_pods": len([p for p in pods if (p.metadata.labels or {}).get("app") == "gpu-tenant-instance"]),
+        "gpu_pods": len([p for p in pods if (p.get("metadata", {}).get("labels", {}) or {}).get("app") == "gpu-tenant-instance"]),
     }
-
 
 @app.get("/api/k8s/pod-status/{namespace}/{pod_name}")
 def get_pod_status(namespace: str, pod_name: str):
-    try:
-        pod = client.CoreV1Api().read_namespaced_pod(name=pod_name, namespace=namespace)
-        return pod_to_dict(pod)
-    except client.exceptions.ApiException as e:
-        raise HTTPException(status_code=e.status, detail=f"Kubernetes error: {e.reason}")
-
+    pod = k8s_raw_request("GET", f"/api/v1/namespaces/{urllib.parse.quote(namespace)}/pods/{urllib.parse.quote(pod_name)}")
+    return raw_pod_to_dict(pod)
 
 @app.get("/api/k8s/pod-exec/{namespace}/{pod_name}")
 def pod_exec_placeholder(namespace: str, pod_name: str):
