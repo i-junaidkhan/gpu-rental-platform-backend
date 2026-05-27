@@ -1,0 +1,22 @@
+Backend stable release: backend_batch14_core_fix3_verified_2026_05_27
+
+Runtime image verified on cluster:
+localhost/backend-batch14-core-fix3:latest
+sha256:46c3d85d576bd8a9ba21f0029a06f2a02788278e84aab40c99aa7532ee10ec13
+
+Verified:
+- /api/health
+- /api/namespaces
+- /api/images
+- /api/hardware/status
+- /api/billing/usage/summary
+- Instance stop/start
+- Jupyter launch URL includes /lab?token=
+- Modular backend routers loaded
+
+Known limitations:
+- GPU scheduling still targets g01
+- Custom images require image preloading on the worker node
+- Billing is MVP calculation, not final time-based billing
+- MFA/roles exist but are not enforced
+- Alert delivery is not implemented
