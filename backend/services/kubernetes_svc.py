@@ -1,4 +1,4 @@
-import os, json, ssl, urllib.request, urllib.parse, urllib.error, logging, uuid
+import os, json, ssl, urllib.request, urllib.parse, urllib.error, logging, uuid, secrets, string
 from typing import Optional, Tuple
 from fastapi import HTTPException
 from kubernetes import client, config
@@ -11,7 +11,7 @@ NODE_NAME = "g01"
 STORAGE_BASE = os.environ.get("STORAGE_BASE_PATH", "/mnt/gpu-rental-storage")
 PVC_NAME = "gpu-rental-storage-pvc"
 
-# ---------- raw Kubernetes API; Python kubernetes client auth is unreliable in this cluster ----------
+# ---------- raw Kubernetes API ----------
 def _k8s_raw_base():
     host = os.environ.get("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc")
     port = os.environ.get("KUBERNETES_SERVICE_PORT", "443")
@@ -93,7 +93,7 @@ def k8s_raw_create_service(namespace: str, service):
 def k8s_raw_delete_service(namespace: str, service_name: str):
     return k8s_raw_request("DELETE", f"/api/v1/namespaces/{q(namespace)}/services/{q(service_name)}", body={})
 
-# Keep client for serialization and fallback logs only.
+# Kubernetes client for some operations
 k8s_v1 = None
 try:
     try:
@@ -144,9 +144,11 @@ def get_instance_command(app_type: Optional[str], token: str) -> list[str]:
     app = (app_type or "terminal").lower()
     safe_token = token or uuid.uuid4().hex
     if app == "jupyter":
-        return ["start-notebook.py", f"--ServerApp.token={safe_token}", "--ServerApp.allow_origin=*", "--ServerApp.ip=0.0.0.0", "--ServerApp.port=8888", "--ServerApp.root_dir=/home/jovyan/workspace"]
+        return ["start-notebook.sh", f"--ServerApp.token={safe_token}", "--ServerApp.allow_origin=*", "--ServerApp.ip=0.0.0.0", "--ServerApp.port=8888", "--ServerApp.root_dir=/home/jovyan/workspace"]
     if app == "vscode":
         return ["code-server", "--bind-addr", "0.0.0.0:8080", "--auth", "none", "/workspace"]
+    if app == "ssh":
+        return []   # SSH image has its own entrypoint
     return ["sleep", "infinity"]
 
 def app_default_port(app_type: Optional[str]) -> int:
@@ -227,8 +229,61 @@ def build_pod_manifest(db: Session, project: models.Project, user: models.User, 
         volumes.append(client.V1Volume(name="dshm", empty_dir=client.V1EmptyDirVolumeSource(medium="Memory", size_limit=f"{instance_obj.shm_gb}Gi")))
         volume_mounts.append(client.V1VolumeMount(name="dshm", mount_path="/dev/shm"))
     security_context = client.V1PodSecurityContext(run_as_user=1000, fs_group=100) if app_type == "jupyter" else None
+
+    # Helper to build env vars
+    env_list = []
+    if instance_obj.env_vars:
+        for key, value in instance_obj.env_vars.items():
+            env_list.append(client.V1EnvVar(name=key, value=str(value)))
+
+    # Determine container definition
+    if app_type == "ssh":
+        import secrets, string
+        ssh_password = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(12))
+        instance_obj.ssh_password = ssh_password
+        container = client.V1Container(
+            name="ssh",
+            image="linuxserver/openssh-server:latest",
+            image_pull_policy="IfNotPresent",
+            env=[
+                client.V1EnvVar(name="PUID", value="1000"),
+                client.V1EnvVar(name="PGID", value="1000"),
+                client.V1EnvVar(name="TZ", value="UTC"),
+                client.V1EnvVar(name="USER_NAME", value="gpuuser"),
+                client.V1EnvVar(name="USER_PASSWORD", value=ssh_password),
+            ] + env_list,
+            ports=[client.V1ContainerPort(container_port=22)],
+            volume_mounts=volume_mounts or None,
+            resources=client.V1ResourceRequirements(limits=limits, requests=requests or None)
+        )
+    else:
+        # Determine base command
+        base_cmd = get_instance_command(app_type, pod_name)
+        # Wrap with startup script if provided
+        if instance_obj.startup_script:
+            # Escape single quotes in script
+            escaped_script = instance_obj.startup_script.replace("'", "'\\''")
+            if base_cmd:
+                combined = f"echo '{escaped_script}' > /tmp/startup.sh && chmod +x /tmp/startup.sh && /tmp/startup.sh && {' '.join(base_cmd)}"
+            else:
+                combined = f"echo '{escaped_script}' > /tmp/startup.sh && chmod +x /tmp/startup.sh && /tmp/startup.sh && sleep infinity"
+            container_cmd = ["/bin/bash", "-c", combined]
+        else:
+            container_cmd = base_cmd
+
+        container = client.V1Container(
+            name="ai-workspace",
+            image=safe_image,
+            image_pull_policy="IfNotPresent",
+            command=container_cmd,
+            env=env_list or None,
+            volume_mounts=volume_mounts or None,
+            ports=[client.V1ContainerPort(container_port=app_default_port(app_type))],
+            resources=client.V1ResourceRequirements(limits=limits, requests=requests or None)
+        )
+
     pod_manifest = client.V1Pod(
         metadata=client.V1ObjectMeta(name=pod_name, labels={"app":"gpu-tenant-instance", "pod_name":pod_name, "user_id":str(user.id), "project_id":str(project.id), "plan_id":str(plan.id), "billing":"true", "app_type":app_type}),
-        spec=client.V1PodSpec(node_name=NODE_NAME, restart_policy="Never", security_context=security_context, volumes=volumes or None, containers=[client.V1Container(name="ai-workspace", image=safe_image, image_pull_policy="IfNotPresent", command=get_instance_command(app_type, pod_name), volume_mounts=volume_mounts or None, ports=[client.V1ContainerPort(container_port=app_default_port(app_type))], resources=client.V1ResourceRequirements(limits=limits, requests=requests or None))])
+        spec=client.V1PodSpec(node_name=NODE_NAME, restart_policy="Never", security_context=security_context, volumes=volumes or None, containers=[container])
     )
     return pod_manifest, pvc_name

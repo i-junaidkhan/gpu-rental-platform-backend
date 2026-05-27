@@ -105,6 +105,9 @@ class InstanceCreate(BaseModel):
     memory_gb: Optional[int] = None
     shm_gb: Optional[int] = None
     storage_id: Optional[int] = None
+    display_name: Optional[str] = None
+    env_vars: Optional[dict] = None
+    startup_script: Optional[str] = None
 
 class InstanceResponse(BaseModel):
     id: int
@@ -123,6 +126,11 @@ class InstanceResponse(BaseModel):
     shm_gb: Optional[int] = None
     storage_id: Optional[int] = None
     created_at: Optional[datetime] = None
+    ssh_password: Optional[str] = None
+    ssh_port: Optional[int] = 22
+    display_name: Optional[str] = None
+    env_vars: Optional[dict] = None
+    startup_script: Optional[str] = None
     class Config:
         from_attributes = True
 

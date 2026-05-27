@@ -1,11 +1,15 @@
-import uuid, logging
+import uuid, logging, time
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from database import get_db
 import models
 from schemas import InstanceCreate, InstanceResponse, InstancePortCreate, InstancePortResponse
-from services.kubernetes_svc import k8s_raw_create_pod, k8s_raw_delete_pod, k8s_raw_read_pod, k8s_raw_create_service, k8s_raw_read_service, k8s_raw_delete_service, calculate_resource_usage, get_node_external_ip, build_launch_url, build_pod_manifest, infer_app_type_from_port, normalize_image_name, NODE_NAME, NAMESPACE
+from services.kubernetes_svc import (
+    k8s_raw_create_pod, k8s_raw_delete_pod, k8s_raw_read_pod, k8s_raw_create_service, k8s_raw_read_service,
+    k8s_raw_delete_service, calculate_resource_usage, get_node_external_ip, build_launch_url,
+    build_pod_manifest, infer_app_type_from_port, normalize_image_name, NODE_NAME, NAMESPACE
+)
 
 router = APIRouter(prefix="/api/instances", tags=["Instances"])
 logger = logging.getLogger(__name__)
@@ -28,12 +32,26 @@ def validate_image(db: Session, image: str) -> str:
     raise HTTPException(status_code=400, detail=f"Image is not allowed: {image}. Add it via /api/images first.")
 
 def _running_gpu_usage(db: Session, project_id: int) -> int:
-    current = db.query(models.Instance).filter(models.Instance.project_id == project_id, models.Instance.status.in_([models.InstanceStatusEnum.RUNNING, models.InstanceStatusEnum.PENDING])).all()
+    current = db.query(models.Instance).filter(
+        models.Instance.project_id == project_id,
+        models.Instance.status.in_([models.InstanceStatusEnum.RUNNING, models.InstanceStatusEnum.PENDING])
+    ).all()
     total = 0
     for inst in current:
         plan = db.query(models.RentalPlan).filter(models.RentalPlan.id == inst.plan_id).first()
         if plan: total += int(plan.resource_count or 0)
     return total
+
+def check_storage_quota(user_id: int, storage_id: int, db: Session):
+    user_storage = db.query(models.UserStorage).filter(
+        models.UserStorage.user_id == user_id,
+        models.UserStorage.id == storage_id
+    ).first()
+    if not user_storage:
+        logger.warning(f"No storage allocation found for user {user_id} storage {storage_id}")
+        return
+    if user_storage.quota_gb > 0 and user_storage.used_gb >= user_storage.quota_gb:
+        raise HTTPException(403, f"Storage quota exceeded: {user_storage.used_gb}/{user_storage.quota_gb} GB used. Cannot create instance.")
 
 @router.get("", response_model=list[InstanceResponse])
 def get_instances(db: Session = Depends(get_db)):
@@ -44,21 +62,41 @@ def create_instance(instance: InstanceCreate, db: Session = Depends(get_db)):
     user = db.query(models.User).filter(models.User.id == instance.user_id).first()
     plan = db.query(models.RentalPlan).filter(models.RentalPlan.id == instance.plan_id).first()
     project = db.query(models.Project).filter(models.Project.id == instance.project_id).first()
-    if not user or not plan or not project: raise HTTPException(status_code=404, detail="User/Plan/Project not found")
-    if user.project_id is not None and user.project_id != project.id: raise HTTPException(status_code=403, detail="User does not belong to the requested project")
+    if not user or not plan or not project:
+        raise HTTPException(status_code=404, detail="User/Plan/Project not found")
+    if user.project_id is not None and user.project_id != project.id:
+        raise HTTPException(status_code=403, detail="User does not belong to the requested project")
+
     requested_count = int(plan.resource_count)
     current_gpu = _running_gpu_usage(db, project.id)
     if not (project.id == 1 and project.max_gpu_count == 0) and current_gpu + requested_count > project.max_gpu_count:
         raise HTTPException(status_code=409, detail={"message":f"Project '{project.name}' GPU quota exceeded.", "max_allowed":project.max_gpu_count, "currently_using":current_gpu, "requested":requested_count})
+
     safe_image = validate_image(db, instance.image)
     usage = calculate_resource_usage(NODE_NAME, plan.k8s_resource_name)
-    if usage["free"] < requested_count: raise HTTPException(status_code=409, detail=f"No available Kubernetes capacity for {plan.k8s_resource_name}")
+    if usage["free"] < requested_count:
+        raise HTTPException(status_code=409, detail=f"No available Kubernetes capacity for {plan.k8s_resource_name}")
+
+    # Storage quota check
+    if instance.storage_id:
+        check_storage_quota(instance.user_id, instance.storage_id, db)
+
     pod_name = f"gpu-p{project.id}-u{user.id}-{uuid.uuid4().hex[:6]}"
-    db_instance = models.Instance(user_id=user.id, project_id=project.id, plan_id=plan.id, pod_name=pod_name, namespace=NAMESPACE, status=models.InstanceStatusEnum.PENDING, pvc_name=None, app_type=instance.app_type or "terminal", image=safe_image, cpu_cores=instance.cpu_cores, memory_gb=instance.memory_gb, shm_gb=instance.shm_gb, storage_id=instance.storage_id)
+    db_instance = models.Instance(
+        user_id=user.id, project_id=project.id, plan_id=plan.id, pod_name=pod_name,
+        namespace=NAMESPACE, status=models.InstanceStatusEnum.PENDING, pvc_name=None,
+        app_type=instance.app_type or "terminal", image=safe_image,
+        cpu_cores=instance.cpu_cores, memory_gb=instance.memory_gb,
+        shm_gb=instance.shm_gb, storage_id=instance.storage_id,
+        display_name=instance.display_name,
+        env_vars=instance.env_vars or {},
+        startup_script=instance.startup_script
+    )
     try:
         db.add(db_instance); db.commit(); db.refresh(db_instance)
     except SQLAlchemyError as e:
         db.rollback(); logger.error(e); raise HTTPException(status_code=500, detail="Database error saving instance")
+
     try:
         manifest, pvc_name = build_pod_manifest(db, project, user, plan, db_instance, safe_image, pod_name)
         k8s_raw_create_pod(namespace=NAMESPACE, manifest=manifest)
@@ -66,9 +104,44 @@ def create_instance(instance: InstanceCreate, db: Session = Depends(get_db)):
         logger.error(f"Pod creation failed: {e}")
         db.delete(db_instance); db.commit()
         raise HTTPException(status_code=500, detail=f"Kubernetes pod creation failed: {e}")
+
     db_instance.status = models.InstanceStatusEnum.RUNNING
     db_instance.pvc_name = pvc_name or ""
     db.commit(); db.refresh(db_instance)
+
+    # Auto-open SSH port if app_type is ssh
+    if instance.app_type == "ssh":
+        try:
+            node_ip = get_node_external_ip(NODE_NAME)
+            service_name = f"{pod_name}-ssh".lower().replace("_", "-")[:63]
+            service_body = {
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {
+                    "name": service_name,
+                    "namespace": NAMESPACE,
+                    "labels": {"app": "gpu-tenant-instance-port", "instance_id": str(db_instance.id), "pod_name": pod_name}
+                },
+                "spec": {
+                    "type": "NodePort",
+                    "selector": {"app": "gpu-tenant-instance", "pod_name": pod_name},
+                    "ports": [{"name": "ssh", "port": 22, "targetPort": 22, "protocol": "TCP"}]
+                }
+            }
+            created = k8s_raw_create_service(NAMESPACE, service_body)
+            node_port = created.get("spec", {}).get("ports", [{}])[0].get("nodePort")
+            if node_port:
+                launch_url = build_launch_url(node_ip, node_port, "ssh")
+                port_row = models.InstancePort(
+                    instance_id=db_instance.id, port=22, target_port=22,
+                    node_port=node_port, protocol="TCP", service_name=service_name,
+                    launch_url=launch_url, status="open"
+                )
+                db.add(port_row)
+                db.commit()
+        except Exception as e:
+            logger.warning(f"Auto-open SSH port failed: {e}")
+
     return db_instance
 
 @router.delete("/{instance_id}")
@@ -81,32 +154,118 @@ def delete_instance(instance_id: int, db: Session = Depends(get_db)):
     inst.status = models.InstanceStatusEnum.DELETED; db.commit()
     return {"message":"Instance deleted", "id":inst.id, "pod_name":inst.pod_name, "status":inst.status.value}
 
+@router.post("/{instance_id}/clone", response_model=InstanceResponse)
+def clone_instance(instance_id: int, db: Session = Depends(get_db)):
+    original = db.query(models.Instance).filter(models.Instance.id == instance_id).first()
+    if not original:
+        raise HTTPException(404, "Instance not found")
+    if original.status not in [models.InstanceStatusEnum.RUNNING, models.InstanceStatusEnum.STOPPED]:
+        raise HTTPException(400, "Can only clone running or stopped instances")
+
+    user = db.query(models.User).filter(models.User.id == original.user_id).first()
+    project = db.query(models.Project).filter(models.Project.id == original.project_id).first()
+    plan = db.query(models.RentalPlan).filter(models.RentalPlan.id == original.plan_id).first()
+    if not user or not project or not plan:
+        raise HTTPException(500, "Missing related data for original instance")
+
+    new_pod_name = f"gpu-p{original.project_id}-u{original.user_id}-{uuid.uuid4().hex[:6]}"
+
+    new_instance = models.Instance(
+        user_id=original.user_id,
+        project_id=original.project_id,
+        plan_id=original.plan_id,
+        pod_name=new_pod_name,
+        namespace=original.namespace,
+        status=models.InstanceStatusEnum.PENDING,
+        app_type=original.app_type,
+        image=original.image,
+        cpu_cores=original.cpu_cores,
+        memory_gb=original.memory_gb,
+        shm_gb=original.shm_gb,
+        storage_id=original.storage_id,
+        display_name=original.display_name,
+        env_vars=original.env_vars or {},
+        startup_script=original.startup_script
+    )
+    db.add(new_instance)
+    db.commit()
+    db.refresh(new_instance)
+
+    try:
+        manifest, pvc_name = build_pod_manifest(db, project, user, plan, new_instance, new_instance.image, new_pod_name)
+        k8s_raw_create_pod(namespace=original.namespace, manifest=manifest)
+        new_instance.status = models.InstanceStatusEnum.RUNNING
+        new_instance.pvc_name = pvc_name or ""
+        db.commit()
+        db.refresh(new_instance)
+    except Exception as e:
+        logger.error(f"Pod creation for clone failed: {e}")
+        new_instance.status = models.InstanceStatusEnum.ERROR
+        db.commit()
+        raise HTTPException(500, f"Cloning failed: {e}")
+
+    return new_instance
+
+@router.put("/{instance_id}/rename")
+def rename_instance(instance_id: int, payload: dict, db: Session = Depends(get_db)):
+    inst = db.query(models.Instance).filter(models.Instance.id == instance_id).first()
+    if not inst:
+        raise HTTPException(404, "Instance not found")
+    new_name = payload.get("display_name")
+    if new_name is None:
+        raise HTTPException(400, "Missing 'display_name' in request body")
+    inst.display_name = new_name
+    db.commit()
+    return {"message": "Instance renamed", "id": instance_id, "display_name": new_name}
+
 @router.post("/{instance_id}/action")
 def instance_action(instance_id: int, payload: dict, db: Session = Depends(get_db)):
     inst = db.query(models.Instance).filter(models.Instance.id == instance_id).first()
     if not inst: raise HTTPException(status_code=404, detail="Instance not found")
     action = payload.get("action", "").lower().strip()
-    if action not in ["start", "stop", "restart"]: raise HTTPException(status_code=400, detail="Invalid action")
+    if action not in ["start", "stop", "restart"]:
+        raise HTTPException(status_code=400, detail="Invalid action")
+
     if action in ["stop", "restart"]:
         try: k8s_raw_delete_pod(inst.namespace, inst.pod_name)
         except HTTPException as e:
             if e.status_code != 404: raise
         inst.status = models.InstanceStatusEnum.STOPPED; db.commit()
-        if action == "stop": return {"message":"Instance stopped", "id":inst.id, "pod_name":inst.pod_name, "status":inst.status.value}
+        if action == "stop":
+            return {"message":"Instance stopped", "id":inst.id, "pod_name":inst.pod_name, "status":inst.status.value}
+
     if action in ["start", "restart"]:
         plan = db.query(models.RentalPlan).filter(models.RentalPlan.id == inst.plan_id).first()
         user = db.query(models.User).filter(models.User.id == inst.user_id).first()
         project = db.query(models.Project).filter(models.Project.id == inst.project_id).first()
-        if not plan or not user or not project: raise HTTPException(status_code=404, detail="Plan/user/project not found for instance")
+        if not plan or not user or not project:
+            raise HTTPException(status_code=404, detail="Plan/user/project not found for instance")
+
         usage = calculate_resource_usage(NODE_NAME, plan.k8s_resource_name)
-        if usage["free"] < int(plan.resource_count): raise HTTPException(status_code=409, detail={"message":f"No available capacity for {plan.k8s_resource_name}", **usage, "requested":int(plan.resource_count)})
+        if usage["free"] < int(plan.resource_count):
+            raise HTTPException(status_code=409, detail={"message":f"No available capacity for {plan.k8s_resource_name}", **usage, "requested":int(plan.resource_count)})
+
         safe_image = validate_image(db, inst.image or "jupyter/minimal-notebook:latest")
+
+        # Wait for pod to be fully deleted (race condition fix)
+        for _ in range(30):
+            try:
+                k8s_raw_read_pod(inst.namespace, inst.pod_name)
+                time.sleep(1)
+            except HTTPException as e:
+                if e.status_code == 404:
+                    break
+        time.sleep(2)
+
         manifest, pvc_name = build_pod_manifest(db, project, user, plan, inst, safe_image, inst.pod_name)
         k8s_raw_create_pod(namespace=inst.namespace, manifest=manifest)
         inst.pvc_name = pvc_name or inst.pvc_name
         inst.status = models.InstanceStatusEnum.RUNNING
         node_ip = get_node_external_ip(NODE_NAME)
-        for port in db.query(models.InstancePort).filter(models.InstancePort.instance_id == inst.id, models.InstancePort.status == "open").all():
+        for port in db.query(models.InstancePort).filter(
+            models.InstancePort.instance_id == inst.id,
+            models.InstancePort.status == "open"
+        ).all():
             app_type = infer_app_type_from_port(port.target_port, inst.app_type)
             port.launch_url = build_launch_url(node_ip, port.node_port, app_type, inst.pod_name)
         db.commit()
@@ -114,7 +273,8 @@ def instance_action(instance_id: int, payload: dict, db: Session = Depends(get_d
 
 @router.get("/{instance_id}/ports", response_model=list[InstancePortResponse])
 def list_instance_ports(instance_id: int, db: Session = Depends(get_db)):
-    if not db.query(models.Instance).filter(models.Instance.id == instance_id).first(): raise HTTPException(status_code=404, detail="Instance not found")
+    if not db.query(models.Instance).filter(models.Instance.id == instance_id).first():
+        raise HTTPException(status_code=404, detail="Instance not found")
     return db.query(models.InstancePort).filter(models.InstancePort.instance_id == instance_id).all()
 
 @router.post("/{instance_id}/ports", response_model=InstancePortResponse)
@@ -124,28 +284,44 @@ def open_instance_port(instance_id: int, payload: InstancePortCreate, db: Sessio
     target_port, exposed_port, protocol = int(payload.target_port or payload.port), int(payload.port), (payload.protocol or "TCP").upper()
     service_name = f"{inst.pod_name}-port-{exposed_port}".lower().replace("_", "-")[:63]
     app_type = infer_app_type_from_port(target_port, inst.app_type)
-    service = __import__('kubernetes').client.V1Service(metadata=__import__('kubernetes').client.V1ObjectMeta(name=service_name, namespace=inst.namespace, labels={"app":"gpu-tenant-instance-port", "instance_id":str(inst.id), "pod_name":inst.pod_name}), spec=__import__('kubernetes').client.V1ServiceSpec(type="NodePort", selector={"app":"gpu-tenant-instance", "pod_name":inst.pod_name}, ports=[__import__('kubernetes').client.V1ServicePort(name=f"port-{exposed_port}", port=exposed_port, target_port=target_port, protocol=protocol)]))
+    service = client.V1Service(
+        metadata=client.V1ObjectMeta(name=service_name, namespace=inst.namespace, labels={"app":"gpu-tenant-instance-port", "instance_id":str(inst.id), "pod_name":inst.pod_name}),
+        spec=client.V1ServiceSpec(type="NodePort", selector={"app":"gpu-tenant-instance", "pod_name":inst.pod_name}, ports=[client.V1ServicePort(name=f"port-{exposed_port}", port=exposed_port, target_port=target_port, protocol=protocol)])
+    )
     try:
         created = k8s_raw_create_service(inst.namespace, service)
     except HTTPException as e:
-        if e.status_code == 409: created = k8s_raw_read_service(inst.namespace, service_name)
+        if e.status_code == 409:
+            created = k8s_raw_read_service(inst.namespace, service_name)
         else: raise
     ports = created.get("spec", {}).get("ports", []) or []
     node_port = ports[0].get("nodePort") if ports else None
     if not node_port: raise HTTPException(status_code=500, detail="Kubernetes failed to assign a NodePort")
     launch_url = build_launch_url(get_node_external_ip(NODE_NAME), node_port, app_type, inst.pod_name)
-    existing = db.query(models.InstancePort).filter(models.InstancePort.instance_id == instance_id, models.InstancePort.port == exposed_port, models.InstancePort.status == "open").first()
+    existing = db.query(models.InstancePort).filter(
+        models.InstancePort.instance_id == instance_id,
+        models.InstancePort.port == exposed_port,
+        models.InstancePort.status == "open"
+    ).first()
     if existing:
-        existing.target_port, existing.node_port, existing.protocol, existing.service_name, existing.launch_url = target_port, node_port, protocol, service_name, launch_url
+        existing.target_port, existing.node_port, existing.protocol = target_port, node_port, protocol
+        existing.service_name, existing.launch_url = service_name, launch_url
         db.commit(); db.refresh(existing); return existing
-    row = models.InstancePort(instance_id=instance_id, port=exposed_port, target_port=target_port, node_port=node_port, protocol=protocol, service_name=service_name, launch_url=launch_url, status="open")
+    row = models.InstancePort(
+        instance_id=instance_id, port=exposed_port, target_port=target_port,
+        node_port=node_port, protocol=protocol, service_name=service_name,
+        launch_url=launch_url, status="open"
+    )
     db.add(row); db.commit(); db.refresh(row); return row
 
 @router.delete("/{instance_id}/ports/{port_id}")
 def close_instance_port(instance_id: int, port_id: int, db: Session = Depends(get_db)):
     inst = db.query(models.Instance).filter(models.Instance.id == instance_id).first()
     if not inst: raise HTTPException(status_code=404, detail="Instance not found")
-    row = db.query(models.InstancePort).filter(models.InstancePort.id == port_id, models.InstancePort.instance_id == instance_id).first()
+    row = db.query(models.InstancePort).filter(
+        models.InstancePort.id == port_id,
+        models.InstancePort.instance_id == instance_id
+    ).first()
     if not row: raise HTTPException(status_code=404, detail="Port record not found")
     try: k8s_raw_delete_service(inst.namespace, row.service_name)
     except HTTPException as e:
@@ -156,5 +332,23 @@ def close_instance_port(instance_id: int, port_id: int, db: Session = Depends(ge
 def get_instance_launch(instance_id: int, db: Session = Depends(get_db)):
     inst = db.query(models.Instance).filter(models.Instance.id == instance_id).first()
     if not inst: raise HTTPException(status_code=404, detail="Instance not found")
-    ports = db.query(models.InstancePort).filter(models.InstancePort.instance_id == instance_id, models.InstancePort.status == "open").all()
-    return {"instance_id":inst.id, "pod_name":inst.pod_name, "status":inst.status.value if hasattr(inst.status, 'value') else str(inst.status), "ports":[{"id":p.id, "port":p.port, "target_port":p.target_port, "node_port":p.node_port, "launch_url":p.launch_url, "status":p.status} for p in ports]}
+    if inst.app_type == "ssh" and inst.ssh_password:
+        port_record = db.query(models.InstancePort).filter(
+            models.InstancePort.instance_id == instance_id,
+            models.InstancePort.port == 22,
+            models.InstancePort.status == "open"
+        ).first()
+        node_port = port_record.node_port if port_record else "unknown"
+        host_ip = get_node_external_ip(NODE_NAME)
+        return {
+            "instance_id": inst.id,
+            "pod_name": inst.pod_name,
+            "status": inst.status.value,
+            "launch_url": f"ssh://gpuuser@{host_ip}:{node_port}",
+            "password": inst.ssh_password
+        }
+    ports = db.query(models.InstancePort).filter(
+        models.InstancePort.instance_id == instance_id,
+        models.InstancePort.status == "open"
+    ).all()
+    return {"instance_id":inst.id, "pod_name":inst.pod_name, "status":inst.status.value, "ports":[{"id":p.id, "port":p.port, "target_port":p.target_port, "node_port":p.node_port, "launch_url":p.launch_url, "status":p.status} for p in ports]}

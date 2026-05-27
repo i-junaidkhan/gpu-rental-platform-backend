@@ -1,15 +1,22 @@
 import logging, csv, io
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Response, Query
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
+from datetime import datetime
 from database import get_db
+from typing import Optional 
 import models
 from schemas import AllowedImageCreate, AllowedImageUpdate, AllowedImageResponse, AlertRuleCreate, AlertRuleUpdate, AlertRuleResponse
-from services.kubernetes_svc import k8s_raw_list_nodes, k8s_raw_read_node, k8s_raw_list_pods, k8s_raw_list_services, k8s_raw_request_text, raw_node_to_dict, raw_pod_to_dict, raw_service_to_dict, normalize_image_name
-from services.kubernetes_svc import k8s_v1
+from services.kubernetes_svc import (
+    k8s_raw_list_nodes, k8s_raw_read_node, k8s_raw_list_pods, k8s_raw_list_services,
+    k8s_raw_request_text, raw_node_to_dict, raw_pod_to_dict, raw_service_to_dict, normalize_image_name, k8s_v1
+)
+from services.alert_notifier import send_slack_notification
+
 router = APIRouter(tags=["Monitoring Images Billing Alerts"])
 logger = logging.getLogger(__name__)
 
+# ---------- Images CRUD ----------
 @router.get("/api/images", response_model=list[AllowedImageResponse])
 def get_images(db: Session = Depends(get_db)):
     return db.query(models.AllowedImage).order_by(models.AllowedImage.id).all()
@@ -34,6 +41,7 @@ def delete_image(image_id: int, db: Session = Depends(get_db)):
     if not row: raise HTTPException(status_code=404, detail="Image not found")
     db.delete(row); db.commit(); return {"message":"Image deleted", "id":image_id}
 
+# ---------- Alerts CRUD ----------
 @router.get("/api/alerts", response_model=list[AlertRuleResponse])
 def get_alerts(db: Session = Depends(get_db)):
     return db.query(models.AlertRule).order_by(models.AlertRule.id).all()
@@ -57,14 +65,38 @@ def delete_alert(alert_id: int, db: Session = Depends(get_db)):
     if not row: raise HTTPException(status_code=404, detail="Alert not found")
     db.delete(row); db.commit(); return {"message":"Alert deleted", "id":alert_id}
 
+@router.put("/api/alerts/{alert_id}/toggle")
+def toggle_alert(alert_id: int, db: Session = Depends(get_db)):
+    rule = db.query(models.AlertRule).filter(models.AlertRule.id == alert_id).first()
+    if not rule:
+        raise HTTPException(404, "Alert rule not found")
+    rule.enabled = not rule.enabled
+    db.commit()
+    return {"id": alert_id, "enabled": rule.enabled}
+
+# ---------- Alert status with Slack delivery ----------
 @router.get("/api/alerts/status")
 def alerts_status(db: Session = Depends(get_db)):
     nodes = [raw_node_to_dict(n) for n in k8s_raw_list_nodes()]
     gpu_rows = monitoring_gpus()
     unhealthy_pods = [raw_pod_to_dict(p) for p in k8s_raw_list_pods(namespace="gpu-rental-system") if p.get("status", {}).get("phase") not in ["Running", "Succeeded"]]
     rules = db.query(models.AlertRule).filter(models.AlertRule.enabled == True).all()
-    return {"enabled_rules": len(rules), "not_ready_nodes": [n for n in nodes if not n.get("ready")], "gpu_rows": gpu_rows, "unhealthy_pods": unhealthy_pods, "delivery": "not implemented in MVP"}
+    for rule in rules:
+        if rule.metric == "gpu_advertised":
+            problem_gpus = [g for g in gpu_rows if g.get("status") == "gpu_present_not_advertised"]
+            if problem_gpus and rule.action in ["slack", "webhook"]:
+                msg = f"Alert '{rule.name}': {len(problem_gpus)} GPUs not advertised on nodes {[g['node_name'] for g in problem_gpus]}"
+                if rule.action == "slack":
+                    send_slack_notification(msg)
+        elif rule.metric == "node_ready":
+            not_ready = [n for n in nodes if not n.get("ready")]
+            if not_ready and rule.action in ["slack", "webhook"]:
+                msg = f"Alert '{rule.name}': Nodes not ready: {[n['name'] for n in not_ready]}"
+                if rule.action == "slack":
+                    send_slack_notification(msg)
+    return {"enabled_rules": len(rules), "not_ready_nodes": [n for n in nodes if not n.get("ready")], "gpu_rows": gpu_rows, "unhealthy_pods": unhealthy_pods, "delivery": "Slack webhook enabled"}
 
+# ---------- Hardware monitoring ----------
 @router.get("/api/hardware/status")
 def hardware_status():
     return {"nodes": monitoring_nodes(), "gpus": monitoring_gpus(), "unhealthy_pods": [raw_pod_to_dict(p) for p in k8s_raw_list_pods(namespace="gpu-rental-system") if p.get("status", {}).get("phase") not in ["Running", "Succeeded"]]}
@@ -100,6 +132,7 @@ def monitoring_gpus():
             rows.append({"node_name":meta.get("name"), "resource_name":"nvidia.com/gpu", "capacity":0, "allocatable":0, "product":labels.get("nvidia.com/gpu.product"), "mig_strategy":labels.get("nvidia.com/mig.strategy"), "status":"gpu_present_not_advertised"})
     return rows
 
+# ---------- Billing ----------
 @router.get("/api/billing/usage/raw")
 def billing_usage_raw(db: Session = Depends(get_db)):
     rows=[]
@@ -117,24 +150,100 @@ def billing_usage_summary(period: str = "daily", db: Session = Depends(get_db)):
 
 @router.post("/api/billing/calculate")
 def billing_calculate(db: Session = Depends(get_db)):
-    running = db.query(models.Instance).filter(models.Instance.status == models.InstanceStatusEnum.RUNNING).all()
-    total=0.0
-    for inst in running:
+    from datetime import datetime
+    now = datetime.utcnow()
+    running_instances = db.query(models.Instance).filter(models.Instance.status == models.InstanceStatusEnum.RUNNING).all()
+    total_added = 0.0
+    for inst in running_instances:
+        last_event = db.query(models.BillingEvent).filter(
+            models.BillingEvent.instance_id == inst.id,
+            models.BillingEvent.event_type == "usage"
+        ).order_by(models.BillingEvent.timestamp.desc()).first()
+        last_time = last_event.timestamp if last_event else inst.created_at
+        if last_time.tzinfo is None:
+            last_time = last_time.replace(tzinfo=None)
+            now_naive = now.replace(tzinfo=None)
+        else:
+            now_naive = now
+        hours_elapsed = (now_naive - last_time).total_seconds() / 3600.0
+        if hours_elapsed <= 0:
+            continue
         plan = db.query(models.RentalPlan).filter(models.RentalPlan.id == inst.plan_id).first()
-        if not plan: continue
-        cost = round(float(plan.price_per_hour) * 0.01, 6)
+        if not plan:
+            continue
+        cost = round(plan.price_per_hour * hours_elapsed, 6)
         inst.accumulated_cost = float(inst.accumulated_cost or 0.0) + cost
-        db.add(models.BillingEvent(project_id=inst.project_id, user_id=inst.user_id, instance_id=inst.id, amount=cost, event_type="usage"))
-        total += cost
+        event = models.BillingEvent(
+            project_id=inst.project_id,
+            user_id=inst.user_id,
+            instance_id=inst.id,
+            amount=cost,
+            event_type="usage"
+        )
+        db.add(event)
+        total_added += cost
     db.commit()
-    return {"message":"Billing calculated", "instances_processed":len(running), "total_cost_added":round(total,6)}
+    return {"message": "Billing calculated", "instances_processed": len(running_instances), "total_cost_added": round(total_added, 6)}
 
 @router.get("/api/billing/export")
-def billing_export(db: Session = Depends(get_db)):
-    rows = billing_usage_raw(db)
-    out = io.StringIO(); w=csv.DictWriter(out, fieldnames=["instance_id","pod_name","user_id","project_id","plan_id","status","price_per_hour","accumulated_cost"]); w.writeheader(); w.writerows(rows)
-    return Response(content=out.getvalue(), media_type="text/csv", headers={"Content-Disposition":"attachment; filename=billing_usage.csv"})
+def billing_export(
+    start_date: Optional[str] = Query(None, description="ISO datetime start filter"),
+    end_date: Optional[str] = Query(None, description="ISO datetime end filter"),
+    project_id: Optional[int] = Query(None, description="Filter by project ID"),
+    db: Session = Depends(get_db)
+):
+    query = db.query(models.Instance)
+    if start_date:
+        try:
+            start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+        except:
+            start_dt = None
+        if start_dt:
+            query = query.filter(models.Instance.created_at >= start_dt)
+    if end_date:
+        try:
+            end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+        except:
+            end_dt = None
+        if end_dt:
+            query = query.filter(models.Instance.created_at <= end_dt)
+    if project_id:
+        query = query.filter(models.Instance.project_id == project_id)
+    instances = query.order_by(models.Instance.id).all()
+    rows = []
+    for i in instances:
+        plan = db.query(models.RentalPlan).filter(models.RentalPlan.id == i.plan_id).first()
+        user = db.query(models.User).filter(models.User.id == i.user_id).first()
+        project = db.query(models.Project).filter(models.Project.id == i.project_id).first()
+        rows.append({
+            "instance_id": i.id,
+            "pod_name": i.pod_name,
+            "display_name": i.display_name or "",
+            "project_id": i.project_id,
+            "project_name": project.name if project else "",
+            "user_id": i.user_id,
+            "username": user.username if user else "",
+            "plan_id": i.plan_id,
+            "plan_name": plan.name if plan else "",
+            "status": i.status.value,
+            "price_per_hour": plan.price_per_hour if plan else 0.0,
+            "accumulated_cost": i.accumulated_cost or 0.0,
+            "created_at": i.created_at.isoformat() if i.created_at else "",
+            "app_type": i.app_type or "",
+            "cpu_cores": i.cpu_cores or "",
+            "memory_gb": i.memory_gb or "",
+            "shm_gb": i.shm_gb or ""
+        })
+    if not rows:
+        # Return empty CSV with headers
+        rows = [{"instance_id":"","pod_name":"","display_name":"","project_id":"","project_name":"","user_id":"","username":"","plan_id":"","plan_name":"","status":"","price_per_hour":"","accumulated_cost":"","created_at":"","app_type":"","cpu_cores":"","memory_gb":"","shm_gb":""}]
+    out = io.StringIO()
+    w = csv.DictWriter(out, fieldnames=rows[0].keys())
+    w.writeheader()
+    w.writerows(rows)
+    return Response(content=out.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=billing_export.csv"})
 
+# ---------- Kubernetes resource endpoints ----------
 @router.get("/api/nodes")
 def get_nodes(): return [raw_node_to_dict(n) for n in k8s_raw_list_nodes()]
 
@@ -167,7 +276,6 @@ def get_services(namespace: str | None = None):
         return [{"name": s.metadata.name, "namespace": s.metadata.namespace, "type": s.spec.type} for s in svc_list.items]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"K8s error: {e}")
-
 
 @router.get("/api/gpu-inventory")
 def get_gpu_inventory():

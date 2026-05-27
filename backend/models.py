@@ -5,6 +5,7 @@ from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from sqlalchemy.exc import SQLAlchemyError
 from database import Base
+from sqlalchemy import JSON
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,13 @@ class Instance(Base):
     pvc_name = Column(String, nullable=True)
     status = Column(Enum(InstanceStatusEnum), default=InstanceStatusEnum.PENDING)
     accumulated_cost = Column(Float, default=0.0)
+    # Add after other columns (e.g., after `accumulated_cost`)
+    ssh_password = Column(String(128), nullable=True)
+    ssh_port = Column(Integer, default=22)
+    
+    display_name = Column(String(255), nullable=True)
+    env_vars = Column(JSON, default={})
+    startup_script = Column(Text, nullable=True)
     # Batch13.1: remember runtime config for restart/recreate.
     app_type = Column(String, nullable=False, default="terminal")
     image = Column(String, nullable=False, default="docker.io/library/ubuntu:22.04")
@@ -86,6 +94,7 @@ class Instance(Base):
     plan = relationship("RentalPlan", back_populates="instances")
     ports = relationship("InstancePort", back_populates="instance")
     billing_events = relationship("BillingEvent", back_populates="instance")
+    
 
 class InstancePort(Base):
     __tablename__ = "instance_ports"
