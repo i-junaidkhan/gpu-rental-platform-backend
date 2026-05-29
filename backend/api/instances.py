@@ -1,4 +1,5 @@
 import uuid, logging, time
+from typing import Tuple
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -8,7 +9,7 @@ from schemas import InstanceCreate, InstanceResponse, InstancePortCreate, Instan
 from services.kubernetes_svc import (
     k8s_raw_create_pod, k8s_raw_delete_pod, k8s_raw_read_pod, k8s_raw_create_service, k8s_raw_read_service,
     k8s_raw_delete_service, calculate_resource_usage, get_node_external_ip, build_launch_url,
-    build_pod_manifest, infer_app_type_from_port, normalize_image_name, NODE_NAME, NAMESPACE
+    build_pod_manifest, infer_app_type_from_port, normalize_image_name, NODE_NAME, NAMESPACE, get_pod_metrics
 )
 
 router = APIRouter(prefix="/api/instances", tags=["Instances"])
@@ -22,6 +23,19 @@ DEFAULT_ALLOWED_IMAGES = {
     "pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime", "docker.io/pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime",
     "tensorflow/tensorflow:2.13.0-gpu", "docker.io/tensorflow/tensorflow:2.13.0-gpu",
 }
+
+def _project_cpu_memory_usage(db: Session, project_id: int) -> Tuple[float, float]:
+    """Return (total_cpu_cores, total_memory_gb) used by RUNNING instances in project."""
+    instances = db.query(models.Instance).filter(
+        models.Instance.project_id == project_id,
+        models.Instance.status == models.InstanceStatusEnum.RUNNING
+    ).all()
+    total_cpu = 0.0
+    total_mem = 0.0
+    for inst in instances:
+        total_cpu += float(inst.cpu_cores or 0)
+        total_mem += float(inst.memory_gb or 0)
+    return total_cpu, total_mem
 
 def validate_image(db: Session, image: str) -> str:
     normalized = normalize_image_name(image)
@@ -67,10 +81,20 @@ def create_instance(instance: InstanceCreate, db: Session = Depends(get_db)):
     if user.project_id is not None and user.project_id != project.id:
         raise HTTPException(status_code=403, detail="User does not belong to the requested project")
 
+    # GPU quota check
     requested_count = int(plan.resource_count)
     current_gpu = _running_gpu_usage(db, project.id)
     if not (project.id == 1 and project.max_gpu_count == 0) and current_gpu + requested_count > project.max_gpu_count:
         raise HTTPException(status_code=409, detail={"message":f"Project '{project.name}' GPU quota exceeded.", "max_allowed":project.max_gpu_count, "currently_using":current_gpu, "requested":requested_count})
+
+    # CPU / Memory quota check
+    used_cpu, used_mem = _project_cpu_memory_usage(db, project.id)
+    requested_cpu = float(instance.cpu_cores or 0)
+    requested_mem = float(instance.memory_gb or 0)
+    if project.max_cpu_cores > 0 and used_cpu + requested_cpu > project.max_cpu_cores:
+        raise HTTPException(409, detail=f"Project CPU quota exceeded: {used_cpu + requested_cpu:.1f} > {project.max_cpu_cores}")
+    if project.max_memory_gb > 0 and used_mem + requested_mem > project.max_memory_gb:
+        raise HTTPException(409, detail=f"Project memory quota exceeded: {used_mem + requested_mem:.1f} > {project.max_memory_gb}")
 
     safe_image = validate_image(db, instance.image)
     usage = calculate_resource_usage(NODE_NAME, plan.k8s_resource_name)
@@ -241,9 +265,19 @@ def instance_action(instance_id: int, payload: dict, db: Session = Depends(get_d
         if not plan or not user or not project:
             raise HTTPException(status_code=404, detail="Plan/user/project not found for instance")
 
+        # GPU capacity check
         usage = calculate_resource_usage(NODE_NAME, plan.k8s_resource_name)
         if usage["free"] < int(plan.resource_count):
             raise HTTPException(status_code=409, detail={"message":f"No available capacity for {plan.k8s_resource_name}", **usage, "requested":int(plan.resource_count)})
+
+        # CPU / Memory quota check
+        used_cpu, used_mem = _project_cpu_memory_usage(db, project.id)
+        requested_cpu = float(inst.cpu_cores or 0)
+        requested_mem = float(inst.memory_gb or 0)
+        if project.max_cpu_cores > 0 and used_cpu + requested_cpu > project.max_cpu_cores:
+            raise HTTPException(409, detail=f"Project CPU quota exceeded: {used_cpu + requested_cpu:.1f} > {project.max_cpu_cores}")
+        if project.max_memory_gb > 0 and used_mem + requested_mem > project.max_memory_gb:
+            raise HTTPException(409, detail=f"Project memory quota exceeded: {used_mem + requested_mem:.1f} > {project.max_memory_gb}")
 
         safe_image = validate_image(db, inst.image or "jupyter/minimal-notebook:latest")
 
@@ -279,6 +313,7 @@ def list_instance_ports(instance_id: int, db: Session = Depends(get_db)):
 
 @router.post("/{instance_id}/ports", response_model=InstancePortResponse)
 def open_instance_port(instance_id: int, payload: InstancePortCreate, db: Session = Depends(get_db)):
+    from kubernetes import client
     inst = db.query(models.Instance).filter(models.Instance.id == instance_id).first()
     if not inst: raise HTTPException(status_code=404, detail="Instance not found")
     target_port, exposed_port, protocol = int(payload.target_port or payload.port), int(payload.port), (payload.protocol or "TCP").upper()
@@ -327,6 +362,20 @@ def close_instance_port(instance_id: int, port_id: int, db: Session = Depends(ge
     except HTTPException as e:
         if e.status_code != 404: raise
     row.status = "closed"; db.commit(); return {"message":"Port closed", "id":row.id, "port":row.port}
+
+@router.get("/{instance_id}/metrics")
+def get_instance_metrics(instance_id: int, db: Session = Depends(get_db)):
+    inst = db.query(models.Instance).filter(models.Instance.id == instance_id).first()
+    if not inst:
+        raise HTTPException(404, "Instance not found")
+    metrics = get_pod_metrics(inst.namespace, inst.pod_name)
+    return {
+        "pod_name": inst.pod_name,
+        "cpu_usage_cores": metrics["cpu_cores"],
+        "memory_usage_mib": metrics["memory_mib"],
+        "cpu_limit_cores": float(inst.cpu_cores) if inst.cpu_cores else None,
+        "memory_limit_mib": float(inst.memory_gb * 1024) if inst.memory_gb else None
+    }
 
 @router.get("/{instance_id}/launch")
 def get_instance_launch(instance_id: int, db: Session = Depends(get_db)):

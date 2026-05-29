@@ -206,6 +206,39 @@ def provision_workspace_subpath(project_id: int, user_id: int, storage_id: Optio
         raise HTTPException(status_code=500, detail=f"Storage provisioning failed: {e}")
     return sub_path, physical_path
 
+
+def get_pod_metrics(namespace: str, pod_name: str) -> dict:
+    """Fetch CPU/memory usage from Kubernetes Metrics API for a pod."""
+    try:
+        path = f"/apis/metrics.k8s.io/v1beta1/namespaces/{q(namespace)}/pods/{q(pod_name)}"
+        metrics = k8s_raw_request("GET", path)
+        containers = metrics.get("containers", [])
+        total_cpu = 0.0
+        total_mem = 0.0
+        for c in containers:
+            usage = c.get("usage", {})
+            cpu_str = usage.get("cpu", "0")
+            mem_str = usage.get("memory", "0")
+            # parse CPU (e.g., "100m" -> 0.1 cores)
+            if cpu_str.endswith("m"):
+                total_cpu += float(cpu_str[:-1]) / 1000
+            else:
+                total_cpu += float(cpu_str)
+            # parse memory (e.g., "512Ki", "1Gi")
+            if mem_str.endswith("Ki"):
+                total_mem += float(mem_str[:-2]) / 1024 / 1024  # to MiB
+            elif mem_str.endswith("Mi"):
+                total_mem += float(mem_str[:-2])
+            elif mem_str.endswith("Gi"):
+                total_mem += float(mem_str[:-2]) * 1024
+            else:
+                total_mem += float(mem_str) / (1024*1024)  # assume bytes
+        return {"cpu_cores": round(total_cpu, 2), "memory_mib": round(total_mem, 0)}
+    except Exception as e:
+        logger.warning(f"Could not fetch pod metrics for {namespace}/{pod_name}: {e}")
+        return {"cpu_cores": None, "memory_mib": None}
+
+
 def build_pod_manifest(db: Session, project: models.Project, user: models.User, plan: models.RentalPlan, instance_obj: models.Instance, safe_image: str, pod_name: str):
     app_type = (instance_obj.app_type or "terminal").lower()
     resource_name, requested_count = plan.k8s_resource_name, int(plan.resource_count)

@@ -33,6 +33,8 @@ class Project(Base):
     description = Column(String, nullable=True)
     max_gpu_count = Column(Integer, default=0)
     max_storage_gb = Column(Integer, default=0)
+    max_cpu_cores = Column(Integer, default=0)   # 0 = unlimited
+    max_memory_gb = Column(Integer, default=0)   # 0 = unlimited
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     users = relationship("User", back_populates="project")
     instances = relationship("Instance", back_populates="project")

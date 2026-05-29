@@ -25,12 +25,16 @@ class ProjectCreate(BaseModel):
     description: Optional[str] = None
     max_gpu_count: int = 0
     max_storage_gb: int = 0
+    max_cpu_cores: int = 0       # new
+    max_memory_gb: int = 0       # new
 
 class ProjectUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     max_gpu_count: Optional[int] = None
     max_storage_gb: Optional[int] = None
+    max_cpu_cores: Optional[int] = None
+    max_memory_gb: Optional[int] = None
 
 class ProjectResponse(BaseModel):
     id: int
@@ -38,6 +42,8 @@ class ProjectResponse(BaseModel):
     description: Optional[str] = None
     max_gpu_count: int
     max_storage_gb: int
+    max_cpu_cores: int
+    max_memory_gb: int
     created_at: Optional[datetime] = None
     class Config:
         from_attributes = True

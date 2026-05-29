@@ -1,23 +1,39 @@
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.pytest_cache/
-*.tar
-*.zip
-*.7z
-*.rar
-*.sql
-*.log
-.env
-backend/__pycache__/
-backend/.pytest_cache/
-backend-batch*.tar
-frontend/build/
+﻿# Dependencies
 node_modules/
-
-backend_BACKUP_batch13_working_*/
-*.zip
-*.tar
 __pycache__/
 *.pyc
+
+# Build outputs
+build/
+dist/
+*.tar
+*.tar.gz
+
+# Environment files
+.env
+.env.local
+.env.development.local
+.env.production.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker temporary files
+*.pid
+
+# Logs
+logs/
+*.log
+
+# Local images
+*.tar
+H:\HnT_Projects\*.tar
+
+# Kubernetes secrets (if any)
+*.secret.yaml
